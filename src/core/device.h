@@ -43,6 +43,7 @@ struct er_device {
     char wake_lock_name[64];
     char awake_lock_name[64];
     int64_t awake_until_ms;
+    struct er_powerd_awake *powerd_awake;
     er_lifecycle_handler lifecycle;
     void *lifecycle_context;
 };

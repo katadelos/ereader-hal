@@ -7,10 +7,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ER_POWER_LOCK "/var/run/ereader-hal-suspend.lock"
@@ -325,12 +327,112 @@ int er_suspend_for(er_device *d, unsigned seconds)
     return suspend_device(d, seconds);
 }
 
+/* Older Kindle kernels expose no Android wake-lock interface. Keep their stock
+ * idle timer alive only while the caller's lease is active. No persistent powerd
+ * flag is changed; process exit also stops renewal. */
+struct er_powerd_awake {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    int64_t until_ms;
+    int fd;
+    bool stop;
+};
+
+static bool powerd_only_awake(const er_device *d)
+{
+    return d->vendor == ER_KINDLE && access("/sys/power/wake_lock", F_OK) < 0 && errno == ENOENT &&
+           access("/sys/power/wake_unlock", F_OK) < 0 && errno == ENOENT;
+}
+
+static void *renew_powerd_idle(void *context)
+{
+    struct er_powerd_awake *lease = context;
+    pthread_mutex_lock(&lease->mutex);
+    while (!lease->stop) {
+        int64_t now = er_now_ms();
+        if (now >= lease->until_ms) {
+            if (lease->fd >= 0) {
+                close(lease->fd);
+                lease->fd = -1;
+            }
+            pthread_cond_wait(&lease->changed, &lease->mutex);
+            continue;
+        }
+        int64_t next = now + 15000;
+        if (next > lease->until_ms)
+            next = lease->until_ms;
+        struct timespec timeout = {next / 1000, (next % 1000) * 1000000};
+        int result = pthread_cond_timedwait(&lease->changed, &lease->mutex, &timeout);
+        if (result == ETIMEDOUT && !lease->stop && er_now_ms() < lease->until_ms) {
+            if (er_kindle_set("com.lab126.powerd", "touchScreenSaverTimeout", 1))
+                lease->until_ms = 0;
+        }
+    }
+    if (lease->fd >= 0)
+        close(lease->fd);
+    pthread_mutex_unlock(&lease->mutex);
+    return NULL;
+}
+
+/* Takes ownership of fd on success. The shared lock blocks HAL suspend calls
+ * from other handles until release or expiry. */
+static int renew_powerd_awake(er_device *d, unsigned seconds, int fd)
+{
+    int64_t until = er_now_ms() + (int64_t)seconds * 1000;
+    struct er_powerd_awake *lease = d->powerd_awake;
+    if (lease) {
+        pthread_mutex_lock(&lease->mutex);
+        if (lease->fd >= 0)
+            close(lease->fd);
+        lease->fd = fd;
+        if (until > lease->until_ms)
+            lease->until_ms = until;
+        d->awake_until_ms = lease->until_ms;
+        pthread_cond_signal(&lease->changed);
+        pthread_mutex_unlock(&lease->mutex);
+        return 0;
+    }
+    lease = calloc(1, sizeof(*lease));
+    if (!lease)
+        return -ENOMEM;
+    int result = pthread_mutex_init(&lease->mutex, NULL);
+    if (result)
+        goto free_lease;
+    pthread_condattr_t attr;
+    result = pthread_condattr_init(&attr);
+    if (result)
+        goto destroy_mutex;
+    result = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (!result)
+        result = pthread_cond_init(&lease->changed, &attr);
+    pthread_condattr_destroy(&attr);
+    if (result)
+        goto destroy_mutex;
+    lease->fd = fd;
+    lease->until_ms = until;
+    result = pthread_create(&lease->thread, NULL, renew_powerd_idle, lease);
+    if (result) {
+        pthread_cond_destroy(&lease->changed);
+        goto destroy_mutex;
+    }
+    d->powerd_awake = lease;
+    d->awake_until_ms = until;
+    return 0;
+destroy_mutex:
+    pthread_mutex_destroy(&lease->mutex);
+free_lease:
+    free(lease);
+    return -result;
+}
+
 int er_awake_probe(const er_device *d, char *reason, size_t size)
 {
     int result = er_supported(d, ER_AWAKE_LEASE);
     if (result)
         return result;
-    if (access("/sys/power/wake_lock", W_OK) || access("/sys/power/wake_unlock", W_OK)) {
+    if (!powerd_only_awake(d) &&
+        (access("/sys/power/wake_lock", W_OK) || access("/sys/power/wake_unlock", W_OK))) {
         result = -errno;
         snprintf(reason, size, "Timed kernel wake locks are unavailable: %s", strerror(-result));
         return result;
@@ -347,7 +449,11 @@ int er_awake_probe(const er_device *d, char *reason, size_t size)
             snprintf(reason, size, "Kindle powerd is unavailable");
             return result;
         }
-        snprintf(reason, size, "Timed kernel lease and powerd idle-timer renewal");
+        snprintf(reason,
+                 size,
+                 "%s",
+                 powerd_only_awake(d) ? "Powerd idle-timer renewal for the lease duration"
+                                      : "Timed kernel lease and powerd idle-timer renewal");
     } else {
         snprintf(reason, size, "Timed kernel lease; Nickel sleep policy requires a native session");
     }
@@ -368,6 +474,12 @@ int er_renew_awake(er_device *d, unsigned seconds)
         result = er_kindle_set("com.lab126.powerd", "touchScreenSaverTimeout", 1);
         if (result)
             goto done;
+    }
+    if (powerd_only_awake(d)) {
+        result = renew_powerd_awake(d, seconds, fd);
+        if (!result)
+            return 0;
+        goto done;
     }
     if (!d->awake_lock_name[0])
         snprintf(d->awake_lock_name,
@@ -394,6 +506,22 @@ int er_release_awake(er_device *d)
 {
     if (!d)
         return -EINVAL;
+    if (d->powerd_awake) {
+        struct er_powerd_awake *lease = d->powerd_awake;
+        pthread_mutex_lock(&lease->mutex);
+        lease->stop = true;
+        pthread_cond_signal(&lease->changed);
+        pthread_mutex_unlock(&lease->mutex);
+        int result = pthread_join(lease->thread, NULL);
+        if (result)
+            return -result;
+        pthread_cond_destroy(&lease->changed);
+        pthread_mutex_destroy(&lease->mutex);
+        free(lease);
+        d->powerd_awake = NULL;
+        d->awake_until_ms = 0;
+        return 0;
+    }
     if (!d->awake_until_ms)
         return 0;
     int result = er_write_text("/sys/power/wake_unlock", d->awake_lock_name);

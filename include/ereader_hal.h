@@ -271,7 +271,9 @@ int er_get_wake_reason(const er_device *device, struct er_wake *wake);
  */
 int er_inhibit_suspend(er_device *device, bool system_scope);
 int er_release_suspend(er_device *device);
-/* Renewable timeout in seconds, 1..86400. Release ends this handle's lease early. */
+/* Renewable timeout in seconds, 1..86400. Release ends this handle's lease early.
+ * Kindles without kernel wake locks renew powerd's idle timer while active;
+ * release restores normal idle behavior and does not override manual sleep. */
 int er_renew_awake(er_device *device, unsigned seconds);
 int er_release_awake(er_device *device);
 /* RTC-relative seconds, 1..86400. Existing alarms are never replaced. Explicit

@@ -4,7 +4,7 @@ PREFIX ?= /usr/local
 CPPFLAGS += -Iinclude -Isrc
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
-LDLIBS += -lrt -ldl -lm
+LDLIBS += -lrt -ldl -lm -pthread
 
 LIB_SOURCES = \
 	src/core/device.c \

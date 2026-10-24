@@ -81,7 +81,7 @@ For a `kindlehf` reader, build on a **Linux computer** with the matching
 
 ```sh
 arm-kindlehf-linux-gnueabihf-gcc -std=c11 -Wall -Wextra -Iinclude \
-  reader-info.c build/libereader-hal.a -lrt -ldl -lm -o reader-info
+  reader-info.c build/libereader-hal.a -lrt -ldl -lm -pthread -o reader-info
 ```
 
 The archive links the HAL into the executable; firmware libraries are still
@@ -168,3 +168,10 @@ bound completion polling; native firmware calls have their own service timeouts.
 structure uses a `present` field mask. Do not interpret an absent measurement
 as zero. Power APIs include nested suspend inhibitors and a renewable awake
 lease; renew a lease before its timeout or call `release_awake()` to end it early.
+
+On Kindles without kernel wake locks, an awake lease renews the stock `powerd`
+idle timer in a background thread. Renewal stops when the lease expires, is
+released, or the process exits. Firmware then follows its normal idle timeout;
+release does not force sleep. The power button and cover can still put the
+Kindle to sleep. Other Kindles also hold a timed kernel wake lock. Kobo uses a
+kernel wake lock and requires the application to manage Nickel's sleep policy.
