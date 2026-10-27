@@ -7,6 +7,27 @@ apps and people writing scripts to inspect or control their reader.
 It provides one API for hardware that differs between models and firmware.
 Your app can check whether a control is usable before showing it to the user.
 
+Runtime identity is available through `er_get_identity()` and Python's
+`Device.get_identity()`: device serial, Wi-Fi interface name and MAC address.
+Unavailable fields are empty strings. Reading identity does not enable the
+radio; its interface and MAC can be absent while Wi-Fi is powered down.
+
+On stock Kindle, a supervising process can call `Device.retain_display()` to
+preserve its application's screen while idle or suspended. `release_display()`
+and `close()` restore the previous `powerd.preventScreenSaver` value. This
+session does not keep the CPU awake: release any awake lease before calling
+`suspend_for(seconds)`. Physical power input must be handled by the application
+while it owns display retention. Keep the owning handle in the supervisor so a
+UI crash cannot leave the screensaver policy changed.
+
+Timed suspend selects the enabled wake-capable RTC, refuses an existing alarm,
+and confirms the kernel completed a suspend cycle. Freeze uses the kernel's
+suspend-success counter because its monotonic clock can keep ticking;
+`get_last_sleep_ms()` reports the complete suspend call's BOOTTIME duration,
+including device entry and resume. `get_last_wake()` records the wake cause,
+including RTC and power-button interrupts multiplexed through a PMIC parent. An active USB or other kernel wake source is
+reported as a suspend blocker; the HAL does not disable it on the caller's behalf.
+
 ## What you can do
 
 - Identify a reader and inspect its hardware features.

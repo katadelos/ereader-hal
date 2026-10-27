@@ -236,6 +236,13 @@ class DeviceInfo:
 
 
 @dataclass(frozen=True)
+class DeviceIdentity:
+    serial: str
+    wifi_interface: str
+    wifi_mac: str
+
+
+@dataclass(frozen=True)
 class Battery:
     percent: int
     state: ChargeState

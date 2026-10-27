@@ -71,6 +71,16 @@ struct er_info {
     struct er_features features;
 };
 
+/* Runtime identity fields are empty when firmware does not expose them.
+ * Reading identity never enables Wi-Fi. wifi_mac describes the current netdev. */
+struct er_identity {
+    char serial[64];
+    char wifi_interface[16];
+    char wifi_mac[18];
+};
+
+int er_get_identity(const er_device *device, struct er_identity *identity);
+
 enum er_charge_state {
     ER_CHARGE_UNKNOWN,
     ER_CHARGING,
@@ -276,6 +286,15 @@ int er_release_suspend(er_device *device);
  * release restores normal idle behavior and does not override manual sleep. */
 int er_renew_awake(er_device *device, unsigned seconds);
 int er_release_awake(er_device *device);
+/* Kindle display retention suppresses the stock screensaver without preventing
+ * kernel suspend. One handle owns the system policy; release/close restores the
+ * previous value. Keep this handle in a supervisor if the UI may be killed. */
+int er_retain_display(er_device *device);
+int er_release_display(er_device *device);
+/* Elapsed BOOTTIME in the last confirmed suspend cycle; 0 on a refused attempt. */
+int er_get_last_sleep_ms(const er_device *device, uint64_t *milliseconds);
+/* Last HAL suspend's wake source, including RTC child IRQs behind a PMIC parent. */
+int er_get_last_wake(const er_device *device, struct er_wake *wake);
 /* RTC-relative seconds, 1..86400. Existing alarms are never replaced. Explicit
  * cancel cancels any owner's alarm. Timed suspend cleans its own alarm on return.
  * Another wake source can cause early resume.

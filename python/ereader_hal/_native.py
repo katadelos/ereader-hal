@@ -57,6 +57,14 @@ class Info(ct.Structure):
     ]
 
 
+class Identity(ct.Structure):
+    _fields_ = [
+        ("serial", ct.c_char * 64),
+        ("wifi_interface", ct.c_char * 16),
+        ("wifi_mac", ct.c_char * 18),
+    ]
+
+
 class Battery(ct.Structure):
     _fields_ = [("percent", ct.c_int), ("state", ct.c_int)]
 
@@ -276,6 +284,7 @@ def load(path=None):
     bind("er_open", ct.POINTER(device))
     bind("er_close", device)
     bind("er_get_info", device, result=ct.POINTER(Info))
+    bind("er_get_identity", device, ct.POINTER(Identity))
     bind("er_get_capability", device, ct.c_int, ct.POINTER(CapabilityInfo))
     for name in ("brightness", "warmth"):
         bind("er_get_" + name, device, ct.POINTER(ct.c_int))
@@ -304,6 +313,10 @@ def load(path=None):
         bind("er_" + name, device, ct.c_uint)
     bind("er_renew_awake", device, ct.c_uint)
     bind("er_release_awake", device)
+    bind("er_retain_display", device)
+    bind("er_release_display", device)
+    bind("er_get_last_sleep_ms", device, ct.POINTER(ct.c_uint64))
+    bind("er_get_last_wake", device, ct.POINTER(Wake))
     bind("er_get_wifi_status", device, ct.POINTER(WifiStatus))
     bind(
         "er_wifi_list_networks",
@@ -373,6 +386,10 @@ def device_info(value):
         capabilities=types.Capability(value.capabilities),
         features=_snapshot(types.Features, value.features),
     )
+
+
+def device_identity(value):
+    return _snapshot(types.DeviceIdentity, value)
 
 
 def capability_info(value):

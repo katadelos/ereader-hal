@@ -6,6 +6,7 @@
 #include "linux/io.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -16,7 +17,174 @@
 #include <unistd.h>
 
 #define ER_POWER_LOCK "/var/run/ereader-hal-suspend.lock"
-#define ALARM "/sys/class/rtc/rtc0/wakealarm"
+#define ER_DISPLAY_LOCK "/var/run/ereader-hal-display.lock"
+
+int er_rtc_path(char *path, size_t size, const char *attribute)
+{
+    glob_t alarms = {0};
+    int result = -ENODEV;
+    if (glob("/sys/class/rtc/rtc*/wakealarm", 0, NULL, &alarms)) {
+        globfree(&alarms);
+        return result;
+    }
+    const char *selected = NULL;
+    for (size_t i = 0; i < alarms.gl_pathc; ++i) {
+        char wakeup[256], state[32];
+        size_t prefix = strlen(alarms.gl_pathv[i]) - strlen("wakealarm");
+        if (prefix + strlen("device/power/wakeup") >= sizeof(wakeup))
+            continue;
+        snprintf(
+            wakeup, sizeof(wakeup), "%.*sdevice/power/wakeup", (int)prefix, alarms.gl_pathv[i]);
+        if (access(alarms.gl_pathv[i], R_OK | W_OK) || er_read_line(wakeup, state, sizeof(state)) ||
+            strcmp(state, "enabled"))
+            continue;
+        if (selected) {
+            result = -EBUSY; /* Never guess between multiple wake sources. */
+            selected = NULL;
+            break;
+        }
+        selected = alarms.gl_pathv[i];
+    }
+    if (selected) {
+        size_t prefix = strlen(selected) - strlen("wakealarm");
+        int length = snprintf(path, size, "%.*s%s", (int)prefix, selected, attribute);
+        result = length < 0 || (size_t)length >= size ? -ENAMETOOLONG : 0;
+    }
+    globfree(&alarms);
+    return result;
+}
+
+static int suspend_success_count(uint64_t *count)
+{
+    FILE *stats = fopen("/sys/kernel/debug/suspend_stats", "r");
+    if (!stats)
+        return -errno;
+    char line[256];
+    int result = -ENODATA;
+    unsigned long long value;
+    while (fgets(line, sizeof(line), stats)) {
+        if (sscanf(line, "success: %llu", &value) == 1) {
+            *count = value;
+            result = 0;
+            break;
+        }
+    }
+    fclose(stats);
+    return result;
+}
+
+static int boottime_ns(int64_t *value)
+{
+    struct timespec time;
+    if (clock_gettime(CLOCK_BOOTTIME, &time))
+        return -errno;
+    *value = (int64_t)time.tv_sec * 1000000000 + time.tv_nsec;
+    return 0;
+}
+
+static int sleep_offset_ns(int64_t *value)
+{
+    struct timespec monotonic, boot;
+    if (clock_gettime(CLOCK_MONOTONIC, &monotonic) || clock_gettime(CLOCK_BOOTTIME, &boot))
+        return -errno;
+    *value =
+        (int64_t)(boot.tv_sec - monotonic.tv_sec) * 1000000000 + boot.tv_nsec - monotonic.tv_nsec;
+    return 0;
+}
+
+int er_get_last_sleep_ms(const er_device *d, uint64_t *milliseconds)
+{
+    if (!d || !milliseconds)
+        return -EINVAL;
+    *milliseconds = d->last_sleep_ms;
+    return 0;
+}
+
+int er_get_last_wake(const er_device *d, struct er_wake *wake)
+{
+    if (!d || !wake)
+        return -EINVAL;
+    *wake = d->last_sleep_ms ? d->last_wake : (struct er_wake){ER_WAKE_UNKNOWN, -1};
+    return 0;
+}
+
+static int wake_interrupt_count(enum er_wake_reason kind, uint64_t *total)
+{
+    FILE *interrupts = fopen("/proc/interrupts", "r");
+    if (!interrupts)
+        return -errno;
+    char line[1024];
+    bool found = false;
+    *total = 0;
+    while (fgets(line, sizeof(line), interrupts)) {
+        bool matching = kind == ER_WAKE_RTC ? strcasestr(line, "rtc") != NULL
+                        : kind == ER_WAKE_POWER
+                            ? strcasestr(line, "pwrkey") || strcasestr(line, "pwr-shortpush") ||
+                                  strcasestr(line, "pwr-midpush") ||
+                                  strcasestr(line, "pwr-longpush")
+                            : strcasestr(line, "hall") != NULL;
+        if (!matching)
+            continue;
+        char *cursor = strchr(line, ':');
+        if (!cursor)
+            continue;
+        ++cursor;
+        for (;;) {
+            char *end;
+            unsigned long long count = strtoull(cursor, &end, 10);
+            if (end == cursor)
+                break;
+            *total += count;
+            cursor = end;
+            found = true;
+        }
+    }
+    fclose(interrupts);
+    return found ? 0 : -ENOENT;
+}
+
+int er_retain_display(er_device *d)
+{
+    if (!d)
+        return -EINVAL;
+    if (d->vendor != ER_KINDLE)
+        return -EOPNOTSUPP;
+    if (d->display_lock_fd >= 0)
+        return 0;
+    int fd = open(ER_DISPLAY_LOCK, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return -errno;
+    int result = flock(fd, LOCK_EX | LOCK_NB) ? -errno : 0;
+    int previous = 0;
+    if (!result)
+        result = er_kindle_get("com.lab126.powerd", "preventScreenSaver", &previous);
+    if (!result && !previous)
+        result = er_kindle_set("com.lab126.powerd", "preventScreenSaver", 1);
+    if (result) {
+        close(fd);
+        return result;
+    }
+    d->display_previous = previous;
+    d->display_lock_fd = fd;
+    return 0;
+}
+
+int er_release_display(er_device *d)
+{
+    if (!d)
+        return -EINVAL;
+    if (d->display_lock_fd < 0)
+        return 0;
+    int current, result = er_kindle_get("com.lab126.powerd", "preventScreenSaver", &current);
+    /* Do not overwrite a policy another owner deliberately changed. */
+    if (!result && current == 1 && d->display_previous != 1)
+        result = er_kindle_set("com.lab126.powerd", "preventScreenSaver", d->display_previous);
+    if (result)
+        return result;
+    close(d->display_lock_fd);
+    d->display_lock_fd = -1;
+    return 0;
+}
 
 static int lock_power(int operation, bool create)
 {
@@ -65,6 +233,20 @@ static int awake_blocker(const er_device *d, char *reason, size_t size)
 
 int er_suspend_blocker(const er_device *d, char *reason, size_t size)
 {
+    if (!strcmp(d->info.suspend_mode, "freeze")) {
+        uint64_t count;
+        int result = suspend_success_count(&count);
+        if (result) {
+            snprintf(
+                reason, size, "Kernel suspend statistics are unavailable: %s", strerror(-result));
+            return result;
+        }
+    }
+    char test[128];
+    if (!er_read_text("/sys/power/pm_test", test, sizeof(test)) && !strstr(test, "[none]")) {
+        snprintf(reason, size, "Kernel suspend test mode is enabled");
+        return -EBUSY;
+    }
     int awake = awake_blocker(d, reason, size);
     if (awake)
         return awake;
@@ -211,20 +393,26 @@ int er_set_wake_alarm(const er_device *d, unsigned seconds)
     int result = er_supported(d, ER_RTC_WAKE);
     if (result)
         return result;
-    char existing[64], text[32];
-    result = er_read_text(ALARM, existing, sizeof(existing));
+    char alarm[256], existing[64], text[32];
+    result = er_rtc_path(alarm, sizeof(alarm), "wakealarm");
+    if (result)
+        return result;
+    result = er_read_text(alarm, existing, sizeof(existing));
     if (result)
         return result;
     if (existing[0] && existing[0] != '\n')
         return -EBUSY;
     snprintf(text, sizeof(text), "+%u\n", seconds);
-    return er_write_text(ALARM, text);
+    return er_write_text(alarm, text);
 }
 
 int er_cancel_wake_alarm(const er_device *d)
 {
     int result = er_supported(d, ER_RTC_WAKE);
-    return result ? result : er_write_text(ALARM, "0\n");
+    char alarm[256];
+    if (!result)
+        result = er_rtc_path(alarm, sizeof(alarm), "wakealarm");
+    return result ? result : er_write_text(alarm, "0\n");
 }
 
 static int notify(er_device *d, enum er_event_type type, int error)
@@ -233,7 +421,7 @@ static int notify(er_device *d, enum er_event_type type, int error)
         return 0;
     struct er_event event = {.type = type};
     if (type == ER_EVENT_RESUMED)
-        er_get_wake_reason(d, &event.data.wake);
+        event.data.wake = d->last_wake;
     if (type == ER_EVENT_SUSPEND_FAILED) {
         event.data.failure.capability = ER_SUSPEND;
         event.data.failure.error = error;
@@ -246,6 +434,14 @@ static int suspend_device(er_device *d, unsigned seconds)
     int result = er_supported(d, ER_SUSPEND);
     if (result)
         return result;
+    d->last_sleep_ms = 0;
+    d->last_wake = (struct er_wake){ER_WAKE_UNKNOWN, -1};
+    uint64_t rtc_before = 0, rtc_after = 0, power_before = 0, power_after = 0;
+    uint64_t success_before = 0, success_after = 0;
+    bool rtc_counted = false, power_counted = false;
+    bool freeze = !strcmp(d->info.suspend_mode, "freeze");
+    int64_t before_sleep = 0, after_sleep = 0, boot_before = 0, boot_after = 0;
+    char alarm[256] = {0}, since_epoch[256] = {0};
     char reason[128], armed[64] = {0};
     int lock = -1;
     bool did_suspend = false, alarm_set = false;
@@ -266,15 +462,20 @@ static int suspend_device(er_device *d, unsigned seconds)
     if (result)
         goto done;
     if (seconds) {
+        result = er_rtc_path(alarm, sizeof(alarm), "wakealarm");
+        if (!result)
+            result = er_rtc_path(since_epoch, sizeof(since_epoch), "since_epoch");
+        if (result)
+            goto done;
         result = er_set_wake_alarm(d, seconds);
         if (result)
             goto done;
         alarm_set = true;
-        result = er_read_text(ALARM, armed, sizeof(armed));
+        result = er_read_text(alarm, armed, sizeof(armed));
         if (result)
             goto done;
         char now[64], *end;
-        result = er_read_text("/sys/class/rtc/rtc0/since_epoch", now, sizeof(now));
+        result = er_read_text(since_epoch, now, sizeof(now));
         if (result)
             goto done;
         long long deadline = strtoll(armed, &end, 10);
@@ -292,13 +493,31 @@ static int suspend_device(er_device *d, unsigned seconds)
             goto done;
         }
     }
-    /* Wakeup-count reads block indefinitely with vendor USB wake locks. */
+    rtc_counted = wake_interrupt_count(ER_WAKE_RTC, &rtc_before) == 0;
+    power_counted = wake_interrupt_count(ER_WAKE_POWER, &power_before) == 0;
+    result = freeze ? suspend_success_count(&success_before) : sleep_offset_ns(&before_sleep);
+    if (!result)
+        result = boottime_ns(&boot_before);
+    if (result)
+        goto done;
+    /* Freeze bypasses syscore/timekeeping suspend, so MONOTONIC need not stop.
+     * Confirm its kernel-completed cycle rather than treating clock offset as
+     * evidence. Both modes report the full suspend call's BOOTTIME duration. */
     result = er_write_text("/sys/power/state", d->info.suspend_mode);
-    did_suspend = result == 0;
+    int measured = boottime_ns(&boot_after);
+    if (!measured)
+        measured = freeze ? suspend_success_count(&success_after) : sleep_offset_ns(&after_sleep);
+    bool confirmed =
+        freeze ? success_after > success_before : after_sleep - before_sleep >= 1000000;
+    did_suspend = !result && !measured && confirmed;
+    if (did_suspend)
+        d->last_sleep_ms = (uint64_t)(boot_after - boot_before) / 1000000;
+    if (!result)
+        result = measured ? measured : (did_suspend ? 0 : -EAGAIN);
 done:
     if (alarm_set) {
         char current[64];
-        int cleanup = er_read_text(ALARM, current, sizeof(current));
+        int cleanup = er_read_text(alarm, current, sizeof(current));
         if (!cleanup && armed[0] && !strcmp(current, armed))
             cleanup = er_cancel_wake_alarm(d);
         else if (!cleanup && current[0] && current[0] != '\n')
@@ -309,6 +528,13 @@ done:
     if (lock >= 0)
         close(lock);
     if (did_suspend) {
+        er_get_wake_reason(d, &d->last_wake);
+        if (power_counted && !wake_interrupt_count(ER_WAKE_POWER, &power_after) &&
+            power_after > power_before)
+            d->last_wake.reason = ER_WAKE_POWER;
+        else if (d->last_wake.reason == ER_WAKE_UNKNOWN && rtc_counted &&
+                 !wake_interrupt_count(ER_WAKE_RTC, &rtc_after) && rtc_after > rtc_before)
+            d->last_wake.reason = ER_WAKE_RTC;
         d->polling_started = false; /* Do not rediscover this same resume in the event poller. */
         notify(d, ER_EVENT_RESUMED, 0);
     } else

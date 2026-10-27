@@ -241,9 +241,10 @@ int er_get_capability(er_device *d, enum er_capability cap, struct er_capability
         info->minimum = 1;
         info->maximum = 86400;
         info->steps = 86400;
-        result = accessible("/sys/class/rtc/rtc0/wakealarm", R_OK | W_OK);
+        char alarm[256];
+        result = er_rtc_path(alarm, sizeof(alarm), "wakealarm");
         if (!result)
-            result = er_read_text("/sys/class/rtc/rtc0/wakealarm", text, sizeof(text));
+            result = er_read_text(alarm, text, sizeof(text));
         if (!result && text[0] && text[0] != '\n') {
             result = -EBUSY;
             snprintf(info->reason, sizeof(info->reason), "An RTC alarm is already armed");

@@ -3,7 +3,9 @@
 #include "backends/kobo/setup.h"
 #include "linux/framebuffer.h"
 #include "linux/io.h"
+#include <ctype.h>
 #include <errno.h>
+#include <glob.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +57,7 @@ int er_open(er_device **out)
     configure_device(d);
     d->saved_brightness = -1;
     d->inhibit_fd = -1;
+    d->display_lock_fd = -1;
     d->low_battery_threshold = 10;
     for (int i = 0; i < ER_INPUT_COUNT; ++i)
         d->input[i].fd = -1;
@@ -87,6 +90,8 @@ int er_close(er_device *d)
     int result = er_release_usb(d);
     if (!result)
         result = er_release_awake(d);
+    if (!result)
+        result = er_release_display(d);
     while (!result && d->inhibit_count)
         result = er_release_suspend(d);
     if (result)
@@ -100,6 +105,47 @@ int er_close(er_device *d)
 const struct er_info *er_get_info(const er_device *d)
 {
     return d ? &d->info : NULL;
+}
+
+int er_get_identity(const er_device *d, struct er_identity *identity)
+{
+    if (!d || !identity)
+        return -EINVAL;
+    *identity = (struct er_identity){0};
+    char text[256];
+    const char *serial_path = d->vendor == ER_KINDLE ? "/proc/usid" : "/mnt/onboard/.kobo/version";
+    if (!er_read_line(serial_path, text, sizeof(text))) {
+        if (d->vendor == ER_KOBO)
+            text[strcspn(text, ",")] = 0;
+        if (strlen(text) < sizeof(identity->serial))
+            memcpy(identity->serial, text, strlen(text) + 1);
+    }
+    if (d->wifi_interface[0])
+        snprintf(
+            identity->wifi_interface, sizeof(identity->wifi_interface), "%s", d->wifi_interface);
+    else {
+        glob_t radios = {0};
+        if (!glob("/sys/class/net/*/wireless", 0, NULL, &radios) && radios.gl_pathc == 1) {
+            const char *name = radios.gl_pathv[0] + strlen("/sys/class/net/");
+            size_t length = strcspn(name, "/");
+            if (length < sizeof(identity->wifi_interface))
+                memcpy(identity->wifi_interface, name, length);
+        }
+        globfree(&radios);
+    }
+    if (identity->wifi_interface[0]) {
+        char path[256];
+        snprintf(path, sizeof(path), "/sys/class/net/%s/address", identity->wifi_interface);
+        if (!er_read_line(path, text, sizeof(text)) && strlen(text) == 17) {
+            bool valid = true;
+            for (size_t i = 0; i < 17; ++i)
+                if (i % 3 == 2 ? text[i] != ':' : !isxdigit((unsigned char)text[i]))
+                    valid = false;
+            if (valid)
+                memcpy(identity->wifi_mac, text, sizeof(identity->wifi_mac));
+        }
+    }
+    return 0;
 }
 
 int er_supported(const er_device *d, enum er_capability cap)

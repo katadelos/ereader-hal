@@ -147,6 +147,10 @@ class Device:
         self._require_open()
         return _native.device_info(self._lib.er_get_info(self._handle).contents)
 
+    def get_identity(self):
+        """Read serial and Wi-Fi identity; unavailable fields are empty strings."""
+        return _native.device_identity(self._get(self._lib.er_get_identity, _native.Identity))
+
     def get_capability(self, capability):
         value = _native.CapabilityInfo()
         self._call(self._lib.er_get_capability, _capability(capability), ct.byref(value))
@@ -275,6 +279,22 @@ class Device:
 
     def release_awake(self):
         self._call(self._lib.er_release_awake)
+
+    def retain_display(self):
+        """Hold stock screensaver policy until release/close; does not block suspend."""
+        self._call(self._lib.er_retain_display)
+
+    def release_display(self):
+        """Restore the screensaver policy saved by this handle."""
+        self._call(self._lib.er_release_display)
+
+    def get_last_sleep_ms(self):
+        """Elapsed milliseconds in the last confirmed suspend cycle, or zero if refused."""
+        return self._get(self._lib.er_get_last_sleep_ms, ct.c_uint64).value
+
+    def get_last_wake(self):
+        """Return the wake source observed around the last HAL suspend call."""
+        return _native.wake(self._get(self._lib.er_get_last_wake, _native.Wake))
 
     def get_wifi_status(self):
         return _native.wifi_status(self._get(self._lib.er_get_wifi_status, _native.WifiStatus))

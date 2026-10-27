@@ -37,6 +37,9 @@ struct er_device {
     int low_battery_threshold;
     int64_t sleep_delta_ms;
     unsigned input_rotation;
+    int display_lock_fd, display_previous;
+    uint64_t last_sleep_ms;
+    struct er_wake last_wake;
     int inhibit_fd;
     unsigned inhibit_count;
     bool system_inhibit;
