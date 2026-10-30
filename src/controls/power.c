@@ -4,6 +4,7 @@
 #include "backends/network.h"
 #include "core/device.h"
 #include "linux/io.h"
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
@@ -68,7 +69,8 @@ unsigned er_rtc_max_seconds(const er_device *d)
 
 struct wake_clock {
     int fd;
-    bool missing_enabled, netronix;
+    bool missing_enabled, netronix, sysfs;
+    char epoch_path[64], alarm_path[64];
 };
 
 static int rtc_open(const er_device *d, struct wake_clock *clock)
@@ -86,6 +88,24 @@ static int rtc_open(const er_device *d, struct wake_clock *clock)
         return result;
     clock->missing_enabled = d->vendor == ER_KINDLE && !strcmp(name, "pmic_rtc");
     clock->netronix = d->vendor == ER_KOBO && !strcmp(name, "pmic_rtc");
+    snprintf(clock->epoch_path, sizeof(clock->epoch_path),
+             "/sys/class/rtc/rtc%u/since_epoch", number);
+    snprintf(clock->alarm_path, sizeof(clock->alarm_path),
+             "/sys/class/rtc/rtc%u/wakealarm", number);
+    /* Lab126's 4.9 RTC ioctls retain the standard request numbers but copy
+     * larger, undocumented payloads. Use the complete sysfs interface when
+     * present, selecting once rather than retrying ioctls after an error.
+     * MC13892's missing enabled flag also makes its sysfs alarm readback
+     * incomplete; retain its ioctl + PMIC contract to protect alarm ownership. */
+    if (!clock->missing_enabled) {
+        int epoch = access(clock->epoch_path, F_OK);
+        if (epoch && errno != ENOENT)
+            return -errno;
+        int alarm = access(clock->alarm_path, F_OK);
+        if (alarm && errno != ENOENT)
+            return -errno;
+        clock->sysfs = !epoch && !alarm;
+    }
     snprintf(node, sizeof(node), "/dev/rtc%u", number);
     clock->fd = open(node, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     return clock->fd < 0 ? -errno : 0;
@@ -108,8 +128,38 @@ static time_t rtc_epoch(const struct rtc_time *time)
     return seconds;
 }
 
+/* An empty wakealarm is the kernel's disabled-alarm representation. */
+static int rtc_sysfs_value(const char *path, time_t *seconds, bool *present)
+{
+    char text[64], *end;
+    int result = er_read_line(path, text, sizeof(text));
+    if (result)
+        return result;
+    *present = *text != '\0';
+    *seconds = 0;
+    if (!*present)
+        return 0;
+    errno = 0;
+    long long value = strtoll(text, &end, 10);
+    if (errno || end == text || value < 0)
+        return -EIO;
+    while (isspace((unsigned char)*end))
+        ++end;
+    if (*end)
+        return -EIO;
+    if ((long long)(time_t)value != value || (time_t)value < 0)
+        return -ERANGE;
+    *seconds = (time_t)value;
+    return 0;
+}
+
 static int rtc_now(const struct wake_clock *clock, time_t *seconds)
 {
+    if (clock->sysfs) {
+        bool present;
+        int result = rtc_sysfs_value(clock->epoch_path, seconds, &present);
+        return result ? result : present ? 0 : -EIO;
+    }
     struct rtc_time time = {0};
     if (ioctl(clock->fd, RTC_RD_TIME, &time))
         return -errno;
@@ -119,6 +169,8 @@ static int rtc_now(const struct wake_clock *clock, time_t *seconds)
 
 static int rtc_alarm(const struct wake_clock *clock, time_t *deadline, bool *enabled)
 {
+    if (clock->sysfs)
+        return rtc_sysfs_value(clock->alarm_path, deadline, enabled);
     struct rtc_wkalrm alarm = {0};
     if (ioctl(clock->fd, RTC_WKALM_RD, &alarm))
         return -errno;
@@ -162,6 +214,19 @@ static int rtc_alarm(const struct wake_clock *clock, time_t *deadline, bool *ena
 
 static int rtc_program(const struct wake_clock *clock, time_t deadline, bool enabled)
 {
+    if (clock->sysfs) {
+        char text[32];
+        snprintf(text, sizeof(text), "%lld\n", enabled ? (long long)deadline : 0LL);
+        int result = er_write_text(clock->alarm_path, text);
+        if (result)
+            return result;
+        time_t actual;
+        bool present;
+        result = rtc_alarm(clock, &actual, &present);
+        if (!result && (present != enabled || (enabled && actual != deadline)))
+            result = -EIO;
+        return result;
+    }
     if (clock->netronix && !enabled) {
         /* This firmware ignores disabled WKALM_SET requests. Disable the
          * countdown explicitly, then replace its stale enabled timestamp with
@@ -452,11 +517,24 @@ int er_suspend_blocker(const er_device *d, char *reason, size_t size)
         return -EPROTO;
     }
     while (fgets(line, sizeof(line), sources)) {
-        char *save, *name = strtok_r(line, " \t\r\n", &save), *value = NULL;
+        /* wakeup_sources separates the name with a tab. Names such as
+         * "WLAN timeout" contain spaces, which are not numeric columns. */
+        char *save, *name = strtok_r(line, "\t\r\n", &save), *value = NULL;
         for (unsigned i = 0; i < active_column; ++i)
             value = strtok_r(NULL, " \t\r\n", &save);
-        if (!name || !value || !strtoull(value, NULL, 10))
+        char *end = NULL;
+        errno = 0;
+        unsigned long long active = value ? strtoull(value, &end, 10) : 0;
+        if (!name || !value || errno || end == value || *end) {
+            fclose(sources);
+            snprintf(reason, size, "Kernel wake-source row has no valid active_since value");
+            return -EPROTO;
+        }
+        if (!active)
             continue;
+        size_t length = strlen(name);
+        while (length && isspace((unsigned char)name[length - 1]))
+            name[--length] = '\0';
         snprintf(reason, size, "Active kernel wake source: %.90s", name);
         fclose(sources);
         return -EBUSY;
