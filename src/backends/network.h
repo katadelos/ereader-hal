@@ -43,8 +43,16 @@ int er_kobo_wifi_wait(const er_device *d, const char *id, bool wait_for_address,
 int er_kobo_wifi_get(const er_device *device, bool *enabled);
 int er_kobo_wifi_set(const er_device *device, bool enabled);
 int er_kobo_wifi_probe(const er_device *device, struct er_capability_info *info);
-int er_kobo_wifi_suspend_blocker(const er_device *device, char *reason, size_t size);
-int er_kobo_wifi_suspend_prepare(const er_device *device, bool *restore);
+struct er_kobo_wifi_suspend_state {
+    bool changed, enabled, radio_loaded, power_loaded, dependency_loaded;
+    bool dvfs_saved, dvfs_enabled;
+    char governor[32];
+    int frequency;
+};
+int er_kobo_wifi_suspend_probe(const er_device *device, char *reason, size_t size);
+int er_kobo_wifi_suspend_prepare(const er_device *device, struct er_kobo_wifi_suspend_state *state);
+int er_kobo_wifi_suspend_restore(const er_device *device,
+                                 const struct er_kobo_wifi_suspend_state *state);
 bool er_wifi_connection_matches(const struct er_wifi_status *status, const char *id,
                                 bool wait_for_address);
 #endif

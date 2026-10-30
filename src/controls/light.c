@@ -78,12 +78,16 @@ int er_set_brightness(er_device *d, int percent)
             return result < 0 ? result : -EIO;
         if (percent > 0)
             d->saved_brightness = percent;
+        er_kobo_light_changed(d, percent);
         return 0;
     }
     if (d->profile->light_channels[0]) {
         result = er_kobo_light_set(d, percent, -1);
-        if (!result && percent > 0)
-            d->saved_brightness = percent;
+        if (!result) {
+            if (percent > 0)
+                d->saved_brightness = percent;
+            er_kobo_light_changed(d, percent);
+        }
         return result;
     }
     int raw = (percent * d->brightness_max + 50) / 100;
@@ -92,8 +96,11 @@ int er_set_brightness(er_device *d, int percent)
                                   : er_kindle_set(POWERD, "flIntensity", native);
     if (!result && d->profile->light_off_path && raw == 0)
         result = er_write_int(d->profile->light_off_path, 0);
-    if (!result && percent > 0)
-        d->saved_brightness = percent;
+    if (!result) {
+        if (percent > 0)
+            d->saved_brightness = percent;
+        er_kobo_light_changed(d, percent);
+    }
     return result;
 }
 

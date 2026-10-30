@@ -9,6 +9,45 @@
 
 #define KOBO_LIGHT "/sys/class/backlight/mxc_msp430.0/brightness"
 
+/* The NTX MSP430/SY7201 ioctl241 path disables PWM immediately, then queues
+ * FL_off_func for 120 jiffies at HZ=100 before releasing the light GPIOs.
+ * This driver has no userspace completion query; a zero level is not a fence.
+ */
+#define NTX_MSP430_LIGHT_OFF_MS 1200
+
+void er_kobo_light_configure(er_device *d)
+{
+    if (!(d->info.capabilities & ER_BRIGHTNESS) || access("/dev/ntx_io", F_OK))
+        return;
+    char controller[64], driver[64];
+    if (er_kobo_hardware_value(d->profile->codes, "MicroP", controller, sizeof(controller)) ||
+        strcmp(controller, "MSP430") ||
+        er_kobo_hardware_value(d->profile->codes, "FrontLight_LEDrv", driver, sizeof(driver)) ||
+        strcmp(driver, "SY7201"))
+        return;
+    d->light_off_settle_ms = NTX_MSP430_LIGHT_OFF_MS;
+    /* A new handle can observe a zero written by another handle while the
+     * hardware shutdown is still queued. Do not infer completion from it.
+     */
+    d->light_off_until_ms = er_now_ms() + d->light_off_settle_ms;
+}
+
+void er_kobo_light_changed(er_device *d, int brightness)
+{
+    if (d->light_off_settle_ms)
+        d->light_off_until_ms = brightness ? 0 : er_now_ms() + d->light_off_settle_ms;
+}
+
+int er_light_prepare_suspend(er_device *d)
+{
+    if (!d)
+        return -EINVAL;
+    int64_t remaining = d->light_off_until_ms - er_now_ms();
+    if (remaining <= 0)
+        return 0;
+    return er_sleep_ms((unsigned)remaining);
+}
+
 struct channel {
     int brightness, power;
 };

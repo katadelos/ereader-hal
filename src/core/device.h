@@ -26,6 +26,8 @@ struct er_device {
     void *brightness_context;
     bool light_valid;
     int light_brightness, light_warmth, light_values[3];
+    unsigned light_off_settle_ms;
+    int64_t light_off_until_ms;
     struct er_input input[ER_INPUT_COUNT];
     struct er_event queue[ER_QUEUE_SIZE];
     unsigned queue_head, queue_count;

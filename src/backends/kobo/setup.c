@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "setup.h"
+#include "light.h"
 #include "core/device.h"
 #include "linux/io.h"
 #include <glob.h>
@@ -126,5 +127,6 @@ void er_kobo_configure(er_device *d)
         !er_profile_matches(p->codes, "388"))
         d->implemented &= ~(ER_WARMTH | ER_BRIGHTNESS | ER_FRONTLIGHT);
 
+    er_kobo_light_configure(d);
     configure_wifi(d);
 }

@@ -1,7 +1,8 @@
 #define _GNU_SOURCE
-#include "controls/power.h"
 #include "backends/kindle/lipc_api.h"
+#include "backends/kobo/light.h"
 #include "backends/network.h"
+#include "controls/power.h"
 #include "core/device.h"
 #include "linux/io.h"
 #include <ctype.h>
@@ -88,10 +89,10 @@ static int rtc_open(const er_device *d, struct wake_clock *clock)
         return result;
     clock->missing_enabled = d->vendor == ER_KINDLE && !strcmp(name, "pmic_rtc");
     clock->netronix = d->vendor == ER_KOBO && !strcmp(name, "pmic_rtc");
-    snprintf(clock->epoch_path, sizeof(clock->epoch_path),
-             "/sys/class/rtc/rtc%u/since_epoch", number);
-    snprintf(clock->alarm_path, sizeof(clock->alarm_path),
-             "/sys/class/rtc/rtc%u/wakealarm", number);
+    snprintf(
+        clock->epoch_path, sizeof(clock->epoch_path), "/sys/class/rtc/rtc%u/since_epoch", number);
+    snprintf(
+        clock->alarm_path, sizeof(clock->alarm_path), "/sys/class/rtc/rtc%u/wakealarm", number);
     /* Lab126's 4.9 RTC ioctls retain the standard request numbers but copy
      * larger, undocumented payloads. Use the complete sysfs interface when
      * present, selecting once rather than retrying ioctls after an error.
@@ -487,13 +488,7 @@ int er_suspend_blocker(const er_device *d, char *reason, size_t size)
     if (result)
         return result;
     if (d->vendor == ER_KOBO) {
-        result = er_kobo_wifi_suspend_blocker(d, reason, size);
-        if (result == -EBUSY) {
-            struct er_capability_info info = {0};
-            result = er_kobo_wifi_probe(d, &info);
-            if (result)
-                snprintf(reason, size, "Cannot restore Wi-Fi after suspend: %s", info.reason);
-        }
+        result = er_kobo_wifi_suspend_probe(d, reason, size);
         if (result)
             return result;
     }
@@ -706,7 +701,8 @@ static int suspend_device(er_device *d, unsigned seconds)
     struct wake_clock clock = {.fd = -1};
     time_t armed = 0, rtc_before_time = 0, rtc_after_time = 0;
     bool kernel_clock = true;
-    bool did_suspend = false, alarm_set = false, radio_restore = false, rtc_fired = false;
+    bool did_suspend = false, alarm_set = false, rtc_fired = false;
+    struct er_kobo_wifi_suspend_state radio_state = {0};
     result = er_suspend_blocker(d, reason, sizeof(reason));
     if (result)
         goto done;
@@ -719,10 +715,13 @@ static int suspend_device(er_device *d, unsigned seconds)
     if (result)
         goto done;
     if (d->vendor == ER_KOBO) {
-        result = er_kobo_wifi_suspend_prepare(d, &radio_restore);
+        result = er_kobo_wifi_suspend_prepare(d, &radio_state);
         if (result)
             goto done;
     }
+    result = er_light_prepare_suspend(d);
+    if (result)
+        goto done;
     result = rtc_open(d, &clock);
     if (result)
         goto done;
@@ -806,8 +805,8 @@ done:
     }
     if (clock.fd >= 0)
         close(clock.fd);
-    if (radio_restore) {
-        int restored = er_kobo_wifi_set(d, true);
+    if (radio_state.changed) {
+        int restored = er_kobo_wifi_suspend_restore(d, &radio_state);
         if (restored)
             result = restored;
     }

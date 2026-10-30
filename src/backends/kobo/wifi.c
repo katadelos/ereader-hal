@@ -11,6 +11,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define DVFS_CONTROL "/sys/devices/platform/mxc_dvfs_core.0/enable"
+#define CPU_GOVERNOR "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+#define CPU_SETSPEED "/sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed"
+
 static int interface_flags(const er_device *d, bool set, bool *enabled)
 {
     int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -47,37 +51,141 @@ static bool module_loaded(const char *name)
 {
     char path[96];
     snprintf(path, sizeof(path), "/sys/module/%s", name);
-    return access(path, F_OK) == 0;
+    return name[0] && access(path, F_OK) == 0;
 }
 
-int er_kobo_wifi_suspend_blocker(const er_device *d, char *reason, size_t size)
+static int dvfs_snapshot(struct er_kobo_wifi_suspend_state *state)
 {
-    if (!er_profile_matches(d->profile->codes, "377") || strcmp(d->wifi_module, "8192es") ||
-        !module_loaded("8192es"))
-        return 0;
-    char path[256];
-    snprintf(path, sizeof(path), "/sys/class/net/%s/device/../../../../of_node", d->wifi_interface);
-    if (access(path, F_OK))
-        return 0;
-    strncat(path, "/keep-power-in-suspend", sizeof(path) - strlen(path) - 1);
-    if (!access(path, F_OK))
-        return 0;
-    if (errno != ENOENT)
-        return -errno;
-    snprintf(
-        reason, size, "Turn Wi-Fi off before suspend; its SDIO host cannot keep the radio powered");
-    return -EBUSY;
-}
-
-int er_kobo_wifi_suspend_prepare(const er_device *d, bool *restore)
-{
-    *restore = false;
-    char reason[128];
-    int result = er_kobo_wifi_suspend_blocker(d, reason, sizeof(reason));
-    if (result != -EBUSY)
+    if (access(DVFS_CONTROL, F_OK))
+        return errno == ENOENT ? 0 : -errno;
+    char text[64];
+    int result = er_read_line(DVFS_CONTROL, text, sizeof(text));
+    if (result)
         return result;
-    result = er_kobo_wifi_get(d, restore);
-    return result ? result : er_kobo_wifi_set(d, false);
+    if (!strcmp(text, "DVFS is enabled"))
+        state->dvfs_enabled = true;
+    else if (strcmp(text, "DVFS is disabled"))
+        return -EPROTO;
+    result = er_read_line(CPU_GOVERNOR, state->governor, sizeof(state->governor));
+    if (!result && !strcmp(state->governor, "userspace")) {
+        result = er_read_int(CPU_SETSPEED, &state->frequency);
+        if (!result && state->frequency <= 0)
+            result = -EPROTO;
+    }
+    state->dvfs_saved = !result;
+    return result;
+}
+
+static int dvfs_restore(const struct er_kobo_wifi_suspend_state *state)
+{
+    if (!state->dvfs_saved)
+        return 0;
+    /* The stock driver ignores cpufreq targets while hardware DVFS is active.
+     * Restore policy after radio recovery, even if a module operation failed. */
+    int result = er_write_text(DVFS_CONTROL, "0");
+    int next = er_write_text(CPU_GOVERNOR, state->governor);
+    if (!result)
+        result = next;
+    if (!strcmp(state->governor, "userspace")) {
+        next = er_write_int(CPU_SETSPEED, state->frequency);
+        if (!result)
+            result = next;
+    }
+    if (state->dvfs_enabled) {
+        next = er_write_text(DVFS_CONTROL, "1");
+        if (!result)
+            result = next;
+    }
+    return result;
+}
+
+static int suspend_state(const er_device *d, struct er_kobo_wifi_suspend_state *state)
+{
+    *state = (struct er_kobo_wifi_suspend_state){0};
+    int result = er_kobo_wifi_get(d, &state->enabled);
+    if (result)
+        return result;
+    state->radio_loaded = module_loaded(d->wifi_module);
+    state->power_loaded = d->wifi_power == ER_WIFI_POWER_MODULE && module_loaded("sdio_wifi_pwr");
+    state->dependency_loaded = !strcmp(d->wifi_module, "moal") && module_loaded("mlan");
+    /* WMT keeps its shared connectivity modules loaded when Wi-Fi is off.
+     * Other backends remove their radio driver as part of powering off. */
+    state->changed = state->enabled || (d->wifi_power != ER_WIFI_POWER_WMT &&
+                                        (state->radio_loaded || state->power_loaded));
+    return state->changed && d->wifi_power == ER_WIFI_POWER_MODULE ? dvfs_snapshot(state) : 0;
+}
+
+static int reloadable(const char *path)
+{
+    return !path[0] ? -ENOENT : access(path, R_OK) ? -errno : 0;
+}
+
+int er_kobo_wifi_suspend_probe(const er_device *d, char *reason, size_t size)
+{
+    struct er_kobo_wifi_suspend_state state;
+    int result = suspend_state(d, &state);
+    if (result)
+        goto failed;
+    if (!state.changed)
+        return 0;
+    if (!d->wifi_module[0]) {
+        result = -ENOTSUP;
+        goto failed;
+    }
+    if (state.enabled && !state.radio_loaded) {
+        result = -EPROTO;
+        goto failed;
+    }
+    /* A netdev parent or device-tree flag cannot prove a stock SDIO driver's
+     * suspend contract. dhd exposes a virtual netdev and must be detached
+     * before the host removes its card. Quiesce all managed radios through
+     * the backend which already owns their module and power lifecycle. */
+    if (d->wifi_power != ER_WIFI_POWER_WMT && state.radio_loaded)
+        result = reloadable(d->wifi_path);
+    if (!result && state.power_loaded)
+        result = reloadable(d->wifi_power_path);
+    if (!result && state.dependency_loaded)
+        result = reloadable(d->wifi_dependency_path);
+    if (!result && state.radio_loaded && d->wifi_power == ER_WIFI_POWER_MODULE &&
+        !state.power_loaded)
+        result = -EPROTO;
+    if (!result && state.radio_loaded && !strcmp(d->wifi_module, "moal") &&
+        !state.dependency_loaded)
+        result = -EPROTO;
+    if (!result && (state.enabled || state.radio_loaded)) {
+        struct er_capability_info info = {0};
+        result = er_kobo_wifi_probe(d, &info);
+    }
+failed:
+    if (result)
+        snprintf(reason, size, "Cannot preserve Wi-Fi across suspend: %s", strerror(-result));
+    return result;
+}
+
+int er_kobo_wifi_suspend_prepare(const er_device *d, struct er_kobo_wifi_suspend_state *state)
+{
+    *state = (struct er_kobo_wifi_suspend_state){0};
+    char reason[128];
+    int result = er_kobo_wifi_suspend_probe(d, reason, sizeof(reason));
+    if (result)
+        return result;
+    result = suspend_state(d, state);
+    if (result) {
+        *state = (struct er_kobo_wifi_suspend_state){0};
+        return result;
+    }
+    if (!state->changed)
+        return 0;
+    /* Retain the snapshot on partial failure for the common cleanup path. */
+    result = er_kobo_wifi_set(d, false);
+    if (!result && d->wifi_power != ER_WIFI_POWER_WMT && module_loaded(d->wifi_module))
+        result = -EBUSY;
+    if (!result && state->power_loaded && module_loaded("sdio_wifi_pwr"))
+        result = -EBUSY;
+    bool enabled;
+    if (!result)
+        result = er_kobo_wifi_get(d, &enabled);
+    return !result && enabled ? -EBUSY : result;
 }
 
 static int module(bool load, const char *name, const char *path)
@@ -198,8 +306,8 @@ static int wmt_power(const er_device *d, bool enabled)
 
 static int dvfs(bool enabled)
 {
-    const char *control = "/sys/devices/platform/mxc_dvfs_core.0/enable";
-    const char *governor = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor";
+    const char *control = DVFS_CONTROL;
+    const char *governor = CPU_GOVERNOR;
     if (access(control, F_OK))
         return 0;
     if (enabled) {
@@ -220,8 +328,7 @@ static int dvfs(bool enabled)
     if (!result)
         result = er_read_line(
             "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", speed, sizeof(speed));
-    return result ? result
-                  : er_write_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed", speed);
+    return result ? result : er_write_text(CPU_SETSPEED, speed);
 }
 
 static int power(const er_device *d, bool enabled)
@@ -283,6 +390,18 @@ static int dhd_control(const er_device *d, bool enabled)
     return er_run(argv, NULL, 0);
 }
 
+static int set_interface(const er_device *d, bool enabled)
+{
+    int result = 0;
+    for (int i = 0; i < 20; ++i) {
+        result = interface_flags(d, true, &enabled);
+        if (result != -ENODEV)
+            break;
+        er_sleep_ms(100);
+    }
+    return result;
+}
+
 int er_kobo_wifi_set(const er_device *d, bool enabled)
 {
     bool current;
@@ -296,7 +415,7 @@ int er_kobo_wifi_set(const er_device *d, bool enabled)
     bool had_wifi = module_loaded(d->wifi_module);
     bool had_dependency = module_loaded("mlan");
     if (!enabled) {
-        result = dhd_control(d, false);
+        result = had_wifi ? dhd_control(d, false) : 0;
         if (!result)
             result = interface_flags(d, true, &enabled);
         if (result && result != -ENODEV)
@@ -329,12 +448,7 @@ int er_kobo_wifi_set(const er_device *d, bool enabled)
             goto undo_dependency;
     }
     er_sleep_ms(!strcmp(d->wifi_module, "moal") ? 2000 : 1000);
-    for (int i = 0; i < 20; ++i) {
-        result = interface_flags(d, true, &enabled);
-        if (result != -ENODEV)
-            break;
-        er_sleep_ms(100);
-    }
+    result = set_interface(d, enabled);
     if (!result)
         result = dhd_control(d, true);
     if (!result)
@@ -348,4 +462,50 @@ undo_power:
     if (!had_power)
         power(d, false);
     return result;
+}
+
+int er_kobo_wifi_suspend_restore(const er_device *d, const struct er_kobo_wifi_suspend_state *state)
+{
+    if (!state->changed)
+        return 0;
+    /* Recreate the captured resources without the public enable operation's
+     * failure unwind: these modules were owned before this sleep attempt. */
+    int result = 0, policy;
+    bool restore_power = d->wifi_power == ER_WIFI_POWER_MODULE
+                             ? state->power_loaded && !module_loaded("sdio_wifi_pwr")
+                             : state->enabled || state->radio_loaded;
+    if (restore_power) {
+        result = power(d, true);
+        if (result)
+            goto done;
+        er_sleep_ms(250);
+    }
+    if (state->dependency_loaded && !module_loaded("mlan")) {
+        result = module(true, "mlan", d->wifi_dependency_path);
+        if (result)
+            goto done;
+    }
+    if (!state->radio_loaded)
+        goto done;
+    bool load_radio = !module_loaded(d->wifi_module);
+    if (load_radio) {
+        result = radio_load(d);
+        if (result)
+            goto done;
+    }
+    if (load_radio || d->wifi_power == ER_WIFI_POWER_WMT)
+        er_sleep_ms(!strcmp(d->wifi_module, "moal") ? 2000 : 1000);
+    if (state->enabled) {
+        result = set_interface(d, true);
+        if (!result)
+            result = dhd_control(d, true);
+    } else {
+        result = dhd_control(d, false);
+        int restored = set_interface(d, false);
+        if (!result)
+            result = restored;
+    }
+done:
+    policy = dvfs_restore(state);
+    return result ? result : policy;
 }
