@@ -92,29 +92,30 @@ int64_t er_now_ms(void)
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-/* CLOCK_BOOTTIME is Linux UAPI 7, absent from early Kindle headers. Older
- * Lab126 kernels expose the RTC-measured suspend total as uptime's fourth field.
- * Other old kernels use their RTC directly in the suspend transaction. */
+/* Lab126 exposes its RTC-measured suspend total as uptime's fourth field.
+ * Prefer that explicit counter: older kernels can overflow the 32-bit
+ * nanosecond sum in CLOCK_BOOTTIME before widening it. Other kernels use
+ * CLOCK_BOOTTIME (Linux UAPI 7, absent from early Kindle headers), or their
+ * RTC directly in the suspend transaction when that clock is unavailable. */
 int er_boot_ms(int64_t *milliseconds)
 {
+    char text[128];
+    int result = er_read_text("/proc/uptime", text, sizeof(text));
+    unsigned long long slept;
+    char extra;
+    if (!result && sscanf(text, "%*s %*s %*s %llu %c", &slept, &extra) == 1) {
+        int64_t awake = er_now_ms();
+        if (slept > (unsigned long long)(INT64_MAX - awake) / 1000)
+            return -EOVERFLOW;
+        *milliseconds = awake + (int64_t)slept * 1000;
+        return 0;
+    }
     struct timespec now;
     if (!clock_gettime((clockid_t)7, &now)) {
         *milliseconds = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
         return 0;
     }
-    if (errno != EINVAL)
-        return -errno;
-    char text[128];
-    int result = er_read_text("/proc/uptime", text, sizeof(text));
-    if (result)
-        return result;
-    unsigned long long slept;
-    if (sscanf(text, "%*s %*s %*s %llu", &slept) != 1)
-        return -EOPNOTSUPP;
-    if (slept > (unsigned long long)INT64_MAX / 1000)
-        return -EOVERFLOW;
-    *milliseconds = er_now_ms() + (int64_t)slept * 1000;
-    return 0;
+    return errno == EINVAL ? (result ? result : -EOPNOTSUPP) : -errno;
 }
 
 int er_sleep_ms(unsigned milliseconds)
