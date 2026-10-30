@@ -13,5 +13,6 @@ int er_write_int(const char *path, int value);
 int er_run(char *const argv[], char *output, size_t size);
 int er_run_timeout(char *const argv[], char *output, size_t size, int timeout_ms);
 int64_t er_now_ms(void);
+int er_boot_ms(int64_t *milliseconds);
 int er_sleep_ms(unsigned milliseconds);
 #endif

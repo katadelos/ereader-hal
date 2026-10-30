@@ -168,7 +168,6 @@ int er_get_capability(er_device *d, enum er_capability cap, struct er_capability
         return 0;
     }
     int result = 0, value;
-    char text[128];
     struct er_display display;
     struct er_usb usb;
     switch (cap) {
@@ -239,16 +238,11 @@ int er_get_capability(er_device *d, enum er_capability cap, struct er_capability
         break;
     case ER_RTC_WAKE:
         info->minimum = 1;
-        info->maximum = 86400;
-        info->steps = 86400;
-        char alarm[256];
-        result = er_rtc_path(alarm, sizeof(alarm), "wakealarm");
-        if (!result)
-            result = er_read_text(alarm, text, sizeof(text));
-        if (!result && text[0] && text[0] != '\n') {
-            result = -EBUSY;
-            snprintf(info->reason, sizeof(info->reason), "An RTC alarm is already armed");
-        }
+        info->maximum = er_rtc_max_seconds(d);
+        info->steps = info->maximum;
+        result = er_rtc_probe(d);
+        if (result == -EBUSY)
+            snprintf(info->reason, sizeof(info->reason), "An RTC alarm is already armed or owned");
         break;
     case ER_SUSPEND:
         if (!strcmp(d->info.suspend_mode, "none"))

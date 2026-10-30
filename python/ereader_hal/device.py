@@ -201,6 +201,14 @@ class Device:
             raise ValueError("rotation must be 0, 90, 180 or 270")
         self._call(self._lib.er_set_rotation, degrees)
 
+    def grab_buttons(self):
+        """Own navigation-bearing evdev nodes until release/close; leave touch shared."""
+        self._call(self._lib.er_grab_buttons)
+
+    def release_buttons(self):
+        """Return exclusively held navigation buttons to firmware and other clients."""
+        self._call(self._lib.er_release_buttons)
+
     def poll_event(self, timeout_ms=-1):
         """Read input or queued events; -1 waits indefinitely. Sample firmware status separately."""
         value = _native.Event()
@@ -291,6 +299,10 @@ class Device:
     def get_last_sleep_ms(self):
         """Elapsed milliseconds in the last confirmed suspend cycle, or zero if refused."""
         return self._get(self._lib.er_get_last_sleep_ms, ct.c_uint64).value
+
+    def get_last_sleep_gap_ms(self):
+        """Milliseconds excluded from CLOCK_MONOTONIC during the last suspend cycle."""
+        return self._get(self._lib.er_get_last_sleep_gap_ms, ct.c_uint64).value
 
     def get_last_wake(self):
         """Return the wake source observed around the last HAL suspend call."""

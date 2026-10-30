@@ -38,7 +38,10 @@ struct er_device {
     int64_t sleep_delta_ms;
     unsigned input_rotation;
     int display_lock_fd, display_previous;
-    uint64_t last_sleep_ms;
+    uint64_t last_sleep_ms, last_sleep_gap_ms;
+    int button_uevent_fd;
+    uint64_t power_event_count;
+    bool buttons_grabbed;
     struct er_wake last_wake;
     int inhibit_fd;
     unsigned inhibit_count;

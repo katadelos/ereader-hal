@@ -7,9 +7,6 @@
 #include <string.h>
 #include <time.h>
 
-/* Linux UAPI value absent from the K4-era toolchain headers. */
-#define ER_CLOCK_BOOTTIME ((clockid_t)7)
-
 void er_input_reset(er_device *d)
 {
     er_input_clear(d);
@@ -151,10 +148,9 @@ int er_sample_status(er_device *d)
         d->last_cover = closed;
         d->cover_valid = true;
     }
-    struct timespec boot, monotonic;
-    if (!clock_gettime(ER_CLOCK_BOOTTIME, &boot) && !clock_gettime(CLOCK_MONOTONIC, &monotonic)) {
-        int64_t delta = ((int64_t)boot.tv_sec - monotonic.tv_sec) * 1000 +
-                        (boot.tv_nsec - monotonic.tv_nsec) / 1000000;
+    int64_t boot;
+    if (!er_boot_ms(&boot)) {
+        int64_t delta = boot - er_now_ms();
         if (d->polling_started && delta - d->sleep_delta_ms > 100) {
             event.type = ER_EVENT_RESUMED;
             er_get_wake_reason(d, &event.data.wake);

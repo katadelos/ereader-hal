@@ -44,6 +44,7 @@ int er_kobo_wifi_get(const er_device *device, bool *enabled);
 int er_kobo_wifi_set(const er_device *device, bool enabled);
 int er_kobo_wifi_probe(const er_device *device, struct er_capability_info *info);
 int er_kobo_wifi_suspend_blocker(const er_device *device, char *reason, size_t size);
+int er_kobo_wifi_suspend_prepare(const er_device *device, bool *restore);
 bool er_wifi_connection_matches(const struct er_wifi_status *status, const char *id,
                                 bool wait_for_address);
 #endif

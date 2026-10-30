@@ -23,8 +23,18 @@ static const char *yes(bool value)
 static const char *charge[] = {"unknown", "charging", "discharging", "full", "not-charging"};
 static const char *usb_modes[] = {"disconnected", "connected", "charging", "data"};
 static const char *actions[] = {"release", "press", "repeat", "move", "cancel"};
-static const char *buttons[] = {
-    "previous", "next", "power", "home", "back", "menu", "up", "down", "left", "right", "select"};
+static const char *buttons[] = {"previous",
+                                "next",
+                                "power",
+                                "home",
+                                "back",
+                                "menu",
+                                "up",
+                                "down",
+                                "left",
+                                "right",
+                                "select",
+                                "keyboard"};
 static void usage(void)
 {
     fprintf(stderr,

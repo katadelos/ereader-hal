@@ -69,6 +69,17 @@ int er_kobo_wifi_suspend_blocker(const er_device *d, char *reason, size_t size)
     return -EBUSY;
 }
 
+int er_kobo_wifi_suspend_prepare(const er_device *d, bool *restore)
+{
+    *restore = false;
+    char reason[128];
+    int result = er_kobo_wifi_suspend_blocker(d, reason, sizeof(reason));
+    if (result != -EBUSY)
+        return result;
+    result = er_kobo_wifi_get(d, restore);
+    return result ? result : er_kobo_wifi_set(d, false);
+}
+
 static int module(bool load, const char *name, const char *path)
 {
     char *insert[] = {"/sbin/insmod", (char *)path, NULL};

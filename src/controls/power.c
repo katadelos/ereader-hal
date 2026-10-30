@@ -8,11 +8,13 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <limits.h>
+#include <linux/rtc.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -21,36 +23,208 @@
 
 int er_rtc_path(char *path, size_t size, const char *attribute)
 {
-    glob_t alarms = {0};
-    int result = -ENODEV;
-    if (glob("/sys/class/rtc/rtc*/wakealarm", 0, NULL, &alarms)) {
-        globfree(&alarms);
+    glob_t clocks = {0};
+    int result = -ENODEV, priority = -1;
+    if (glob("/sys/class/rtc/rtc*/name", 0, NULL, &clocks)) {
+        globfree(&clocks);
         return result;
     }
     const char *selected = NULL;
-    for (size_t i = 0; i < alarms.gl_pathc; ++i) {
-        char wakeup[256], state[32];
-        size_t prefix = strlen(alarms.gl_pathv[i]) - strlen("wakealarm");
-        if (prefix + strlen("device/power/wakeup") >= sizeof(wakeup))
+    bool ambiguous = false;
+    for (size_t i = 0; i < clocks.gl_pathc; ++i) {
+        char name[64];
+        if (er_read_line(clocks.gl_pathv[i], name, sizeof(name)))
             continue;
-        snprintf(
-            wakeup, sizeof(wakeup), "%.*sdevice/power/wakeup", (int)prefix, alarms.gl_pathv[i]);
-        if (access(alarms.gl_pathv[i], R_OK | W_OK) || er_read_line(wakeup, state, sizeof(state)) ||
-            strcmp(state, "enabled"))
-            continue;
-        if (selected) {
-            result = -EBUSY; /* Never guess between multiple wake sources. */
-            selected = NULL;
-            break;
+        /* MAX77696 alarm0 also serves firmware hibernation; pmic_rtc is
+         * the wake-capable external clock on older i.MX/Netronix hardware. */
+        int candidate = !strcmp(name, "max77696-rtc.1") ? 2 : !strcmp(name, "pmic_rtc") ? 1 : 0;
+        if (candidate > priority) {
+            selected = clocks.gl_pathv[i];
+            priority = candidate;
+            ambiguous = false;
+        } else if (candidate == priority) {
+            ambiguous = true;
         }
-        selected = alarms.gl_pathv[i];
     }
-    if (selected) {
-        size_t prefix = strlen(selected) - strlen("wakealarm");
+    if (ambiguous)
+        result = -EBUSY;
+    else if (selected) {
+        size_t prefix = strlen(selected) - strlen("name");
         int length = snprintf(path, size, "%.*s%s", (int)prefix, selected, attribute);
         result = length < 0 || (size_t)length >= size ? -ENAMETOOLONG : 0;
     }
-    globfree(&alarms);
+    globfree(&clocks);
+    return result;
+}
+
+unsigned er_rtc_max_seconds(const er_device *d)
+{
+    char path[256], name[64];
+    if (d && d->vendor == ER_KOBO && !er_rtc_path(path, sizeof(path), "name") &&
+        !er_read_line(path, name, sizeof(name)) && !strcmp(name, "pmic_rtc"))
+        return UINT16_MAX; /* Netronix MSP430 has a 16-bit seconds countdown. */
+    return 86400;
+}
+
+struct wake_clock {
+    int fd;
+    bool missing_enabled, netronix;
+};
+
+static int rtc_open(const er_device *d, struct wake_clock *clock)
+{
+    *clock = (struct wake_clock){.fd = -1};
+    char path[256], name[64], node[64];
+    int result = er_rtc_path(path, sizeof(path), "name");
+    unsigned number;
+    if (result)
+        return result;
+    if (sscanf(path, "/sys/class/rtc/rtc%u/name", &number) != 1)
+        return -EINVAL;
+    result = er_read_line(path, name, sizeof(name));
+    if (result)
+        return result;
+    clock->missing_enabled = d->vendor == ER_KINDLE && !strcmp(name, "pmic_rtc");
+    clock->netronix = d->vendor == ER_KOBO && !strcmp(name, "pmic_rtc");
+    snprintf(node, sizeof(node), "/dev/rtc%u", number);
+    clock->fd = open(node, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    return clock->fd < 0 ? -errno : 0;
+}
+
+static time_t rtc_epoch(const struct rtc_time *time)
+{
+    struct tm value = {.tm_sec = time->tm_sec,
+                       .tm_min = time->tm_min,
+                       .tm_hour = time->tm_hour,
+                       .tm_mday = time->tm_mday,
+                       .tm_mon = time->tm_mon,
+                       .tm_year = time->tm_year};
+    time_t seconds = timegm(&value);
+    /* timegm normalizes malformed RTC fields instead of rejecting them. */
+    if (value.tm_sec != time->tm_sec || value.tm_min != time->tm_min ||
+        value.tm_hour != time->tm_hour || value.tm_mday != time->tm_mday ||
+        value.tm_mon != time->tm_mon || value.tm_year != time->tm_year)
+        return -1;
+    return seconds;
+}
+
+static int rtc_now(const struct wake_clock *clock, time_t *seconds)
+{
+    struct rtc_time time = {0};
+    if (ioctl(clock->fd, RTC_RD_TIME, &time))
+        return -errno;
+    *seconds = rtc_epoch(&time);
+    return *seconds < 0 ? -EIO : 0;
+}
+
+static int rtc_alarm(const struct wake_clock *clock, time_t *deadline, bool *enabled)
+{
+    struct rtc_wkalrm alarm = {0};
+    if (ioctl(clock->fd, RTC_WKALM_RD, &alarm))
+        return -errno;
+    *deadline = rtc_epoch(&alarm.time);
+    *enabled = alarm.enabled != 0;
+    if (clock->missing_enabled) {
+        /* MC13892's stock RTC driver omits alarm.enabled. Its alarm register
+         * has a disable bit and an invalid time-of-day sentinel at reset. */
+        struct {
+            int reg;
+            uint32_t value, mask;
+        } info = {.reg = 21};
+        int fd = open("/dev/pmic", O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            return -errno;
+        int result = ioctl(fd, _IOWR('P', 0xa0, uint32_t), &info) ? -errno : 0;
+        close(fd);
+        if (result)
+            return result;
+        time_t now;
+        result = rtc_now(clock, &now);
+        if (result)
+            return result;
+        bool programmed = !(info.value & (1u << 20)) && (info.value & 0x1ffff) < 86400;
+        if (programmed && *deadline < 0)
+            return -EIO;
+        *enabled = programmed && *deadline > now;
+    }
+    if (*enabled && *deadline < 0)
+        return -EIO;
+    if (clock->netronix && *enabled) {
+        time_t now;
+        int result = rtc_now(clock, &now);
+        if (result)
+            return result;
+        /* The firmware leaves enabled latched after its one-shot countdown. */
+        *enabled = *deadline > now;
+    }
+    return 0;
+}
+
+static int rtc_program(const struct wake_clock *clock, time_t deadline, bool enabled)
+{
+    if (clock->netronix && !enabled) {
+        /* This firmware ignores disabled WKALM_SET requests. Disable the
+         * countdown explicitly, then replace its stale enabled timestamp with
+         * a past one-shot alarm; the driver does not arm past deadlines. */
+        if (ioctl(clock->fd, RTC_AIE_OFF, 0))
+            return -errno;
+        time_t now;
+        int result = rtc_now(clock, &now);
+        if (result || now <= 0)
+            return result ? result : -EIO;
+        deadline = now - 1;
+        enabled = true;
+    }
+    struct tm value;
+    if (!gmtime_r(&deadline, &value))
+        return -ERANGE;
+    struct rtc_wkalrm alarm = {.enabled = enabled};
+    alarm.time = (struct rtc_time){.tm_sec = value.tm_sec,
+                                   .tm_min = value.tm_min,
+                                   .tm_hour = value.tm_hour,
+                                   .tm_mday = value.tm_mday,
+                                   .tm_mon = value.tm_mon,
+                                   .tm_year = value.tm_year,
+                                   .tm_wday = value.tm_wday,
+                                   .tm_yday = value.tm_yday};
+    if (ioctl(clock->fd, RTC_WKALM_SET, &alarm))
+        return -errno;
+    if (clock->missing_enabled && ioctl(clock->fd, enabled ? RTC_AIE_ON : RTC_AIE_OFF, 0))
+        return -errno;
+    return 0;
+}
+
+static bool rtc_woke(const struct wake_clock *clock)
+{
+    if (clock->netronix) {
+        /* Battery/resume handling may consume the MSP430 status register.
+         * ntx_io keeps its alarm cause latched until this ioctl reads it. */
+        int fd = open("/dev/ntx_io", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0)
+            return false;
+        unsigned long flag = 0;
+        int result = ioctl(fd, 123, &flag);
+        close(fd);
+        return !result && flag;
+    }
+    unsigned long events = 0;
+    return read(clock->fd, &events, sizeof(events)) == sizeof(events) && (events & RTC_AF);
+}
+
+int er_rtc_probe(const er_device *d)
+{
+    struct wake_clock clock;
+    int result = rtc_open(d, &clock);
+    if (!result) {
+        time_t deadline, now;
+        bool enabled;
+        result = rtc_now(&clock, &now);
+        if (!result)
+            result = rtc_alarm(&clock, &deadline, &enabled);
+        if (!result && enabled)
+            result = -EBUSY;
+        close(clock.fd);
+    }
     return result;
 }
 
@@ -73,30 +247,19 @@ static int suspend_success_count(uint64_t *count)
     return result;
 }
 
-static int boottime_ns(int64_t *value)
-{
-    struct timespec time;
-    if (clock_gettime(CLOCK_BOOTTIME, &time))
-        return -errno;
-    *value = (int64_t)time.tv_sec * 1000000000 + time.tv_nsec;
-    return 0;
-}
-
-static int sleep_offset_ns(int64_t *value)
-{
-    struct timespec monotonic, boot;
-    if (clock_gettime(CLOCK_MONOTONIC, &monotonic) || clock_gettime(CLOCK_BOOTTIME, &boot))
-        return -errno;
-    *value =
-        (int64_t)(boot.tv_sec - monotonic.tv_sec) * 1000000000 + boot.tv_nsec - monotonic.tv_nsec;
-    return 0;
-}
-
 int er_get_last_sleep_ms(const er_device *d, uint64_t *milliseconds)
 {
     if (!d || !milliseconds)
         return -EINVAL;
     *milliseconds = d->last_sleep_ms;
+    return 0;
+}
+
+int er_get_last_sleep_gap_ms(const er_device *d, uint64_t *milliseconds)
+{
+    if (!d || !milliseconds)
+        return -EINVAL;
+    *milliseconds = d->last_sleep_gap_ms;
     return 0;
 }
 
@@ -121,7 +284,8 @@ static int wake_interrupt_count(enum er_wake_reason kind, uint64_t *total)
                         : kind == ER_WAKE_POWER
                             ? strcasestr(line, "pwrkey") || strcasestr(line, "pwr-shortpush") ||
                                   strcasestr(line, "pwr-midpush") ||
-                                  strcasestr(line, "pwr-longpush")
+                                  strcasestr(line, "pwr-longpush") ||
+                                  strcasestr(line, "onkey_press") || strcasestr(line, "onkey_rel")
                             : strcasestr(line, "hall") != NULL;
         if (!matching)
             continue;
@@ -259,6 +423,12 @@ int er_suspend_blocker(const er_device *d, char *reason, size_t size)
         return result;
     if (d->vendor == ER_KOBO) {
         result = er_kobo_wifi_suspend_blocker(d, reason, size);
+        if (result == -EBUSY) {
+            struct er_capability_info info = {0};
+            result = er_kobo_wifi_probe(d, &info);
+            if (result)
+                snprintf(reason, size, "Cannot restore Wi-Fi after suspend: %s", info.reason);
+        }
         if (result)
             return result;
     }
@@ -268,25 +438,26 @@ int er_suspend_blocker(const er_device *d, char *reason, size_t size)
         return 0;
     }
     char line[1024];
+    unsigned active_column = 0, column = 0;
+    if (fgets(line, sizeof(line), sources)) {
+        char *save;
+        for (char *word = strtok_r(line, " \t\r\n", &save); word;
+             word = strtok_r(NULL, " \t\r\n", &save), ++column)
+            if (!strcmp(word, "active_since"))
+                active_column = column;
+    }
+    if (!active_column) {
+        fclose(sources);
+        snprintf(reason, size, "Kernel wake-source format has no active_since field");
+        return -EPROTO;
+    }
     while (fgets(line, sizeof(line), sources)) {
-        char *columns = strchr(line, '\t');
-        if (!columns)
+        char *save, *name = strtok_r(line, " \t\r\n", &save), *value = NULL;
+        for (unsigned i = 0; i < active_column; ++i)
+            value = strtok_r(NULL, " \t\r\n", &save);
+        if (!name || !value || !strtoull(value, NULL, 10))
             continue;
-        *columns++ = '\0';
-        unsigned long long count, events, wakeups, expires, active;
-        if (sscanf(columns,
-                   "%llu %llu %llu %llu %llu",
-                   &count,
-                   &events,
-                   &wakeups,
-                   &expires,
-                   &active) != 5 ||
-            !active)
-            continue;
-        size_t length = strlen(line);
-        while (length && line[length - 1] == ' ')
-            line[--length] = 0;
-        snprintf(reason, size, "Active kernel wake source: %.90s", line);
+        snprintf(reason, size, "Active kernel wake source: %.90s", name);
         fclose(sources);
         return -EBUSY;
     }
@@ -388,31 +559,40 @@ int er_get_wake_reason(const er_device *d, struct er_wake *wake)
 
 int er_set_wake_alarm(const er_device *d, unsigned seconds)
 {
-    if (!d || !seconds || seconds > 86400)
+    if (!d || !seconds)
         return -EINVAL;
+    if (seconds > er_rtc_max_seconds(d))
+        return -ERANGE;
     int result = er_supported(d, ER_RTC_WAKE);
-    if (result)
-        return result;
-    char alarm[256], existing[64], text[32];
-    result = er_rtc_path(alarm, sizeof(alarm), "wakealarm");
-    if (result)
-        return result;
-    result = er_read_text(alarm, existing, sizeof(existing));
-    if (result)
-        return result;
-    if (existing[0] && existing[0] != '\n')
-        return -EBUSY;
-    snprintf(text, sizeof(text), "+%u\n", seconds);
-    return er_write_text(alarm, text);
+    struct wake_clock clock = {.fd = -1};
+    if (!result)
+        result = rtc_open(d, &clock);
+    time_t now, deadline;
+    bool enabled;
+    if (!result)
+        result = rtc_alarm(&clock, &deadline, &enabled);
+    if (!result && enabled)
+        result = -EBUSY;
+    if (!result)
+        result = rtc_now(&clock, &now);
+    if (!result)
+        result = rtc_program(&clock, now + seconds, true);
+    if (clock.fd >= 0)
+        close(clock.fd);
+    return result;
 }
 
 int er_cancel_wake_alarm(const er_device *d)
 {
     int result = er_supported(d, ER_RTC_WAKE);
-    char alarm[256];
+    struct wake_clock clock = {.fd = -1};
     if (!result)
-        result = er_rtc_path(alarm, sizeof(alarm), "wakealarm");
-    return result ? result : er_write_text(alarm, "0\n");
+        result = rtc_open(d, &clock);
+    if (!result)
+        result = rtc_program(&clock, 0, false);
+    if (clock.fd >= 0)
+        close(clock.fd);
+    return result;
 }
 
 static int notify(er_device *d, enum er_event_type type, int error)
@@ -435,16 +615,20 @@ static int suspend_device(er_device *d, unsigned seconds)
     if (result)
         return result;
     d->last_sleep_ms = 0;
+    d->last_sleep_gap_ms = 0;
     d->last_wake = (struct er_wake){ER_WAKE_UNKNOWN, -1};
     uint64_t rtc_before = 0, rtc_after = 0, power_before = 0, power_after = 0;
     uint64_t success_before = 0, success_after = 0;
     bool rtc_counted = false, power_counted = false;
     bool freeze = !strcmp(d->info.suspend_mode, "freeze");
-    int64_t before_sleep = 0, after_sleep = 0, boot_before = 0, boot_after = 0;
-    char alarm[256] = {0}, since_epoch[256] = {0};
-    char reason[128], armed[64] = {0};
+    int64_t mono_before = 0, mono_after = 0, boot_before = 0, boot_after = 0;
+    uint64_t power_events_before = 0;
+    char reason[128];
     int lock = -1;
-    bool did_suspend = false, alarm_set = false;
+    struct wake_clock clock = {.fd = -1};
+    time_t armed = 0, rtc_before_time = 0, rtc_after_time = 0;
+    bool kernel_clock = true;
+    bool did_suspend = false, alarm_set = false, radio_restore = false, rtc_fired = false;
     result = er_suspend_blocker(d, reason, sizeof(reason));
     if (result)
         goto done;
@@ -456,84 +640,110 @@ static int suspend_device(er_device *d, unsigned seconds)
     result = awake_blocker(d, reason, sizeof(reason));
     if (result)
         goto done;
+    if (d->vendor == ER_KOBO) {
+        result = er_kobo_wifi_suspend_prepare(d, &radio_restore);
+        if (result)
+            goto done;
+    }
+    result = rtc_open(d, &clock);
+    if (result)
+        goto done;
+    rtc_woke(&clock); /* Discard a wake flag from a previous, unrelated cycle. */
+    if (seconds) {
+        time_t existing, now;
+        bool enabled;
+        result = rtc_alarm(&clock, &existing, &enabled);
+        if (!result && enabled)
+            result = -EBUSY;
+        if (!result)
+            result = rtc_now(&clock, &now);
+        if (result)
+            goto done;
+        armed = now + seconds;
+        alarm_set = true; /* Clean up even if the driver partially applies it. */
+        result = rtc_program(&clock, armed, true);
+        if (result)
+            goto done;
+    }
     result = notify(d, ER_EVENT_PREPARE_SLEEP, 0);
     if (result > 0)
         result = -EINVAL;
     if (result)
         goto done;
-    if (seconds) {
-        result = er_rtc_path(alarm, sizeof(alarm), "wakealarm");
-        if (!result)
-            result = er_rtc_path(since_epoch, sizeof(since_epoch), "since_epoch");
-        if (result)
-            goto done;
-        result = er_set_wake_alarm(d, seconds);
-        if (result)
-            goto done;
-        alarm_set = true;
-        result = er_read_text(alarm, armed, sizeof(armed));
-        if (result)
-            goto done;
-        char now[64], *end;
-        result = er_read_text(since_epoch, now, sizeof(now));
-        if (result)
-            goto done;
-        long long deadline = strtoll(armed, &end, 10);
-        if (end == armed || deadline <= 0) {
-            result = -EIO;
-            goto done;
-        }
-        long long rtc_now = strtoll(now, &end, 10);
-        if (end == now || rtc_now <= 0) {
-            result = -EIO;
-            goto done;
-        }
-        if (deadline <= rtc_now) {
-            result = -ETIMEDOUT;
-            goto done;
-        }
-    }
+    /* Pending input belongs to the awake period, not the coming wake cause. */
+    er_input_poll(d, 0);
+    power_events_before = d->power_event_count;
     rtc_counted = wake_interrupt_count(ER_WAKE_RTC, &rtc_before) == 0;
     power_counted = wake_interrupt_count(ER_WAKE_POWER, &power_before) == 0;
-    result = freeze ? suspend_success_count(&success_before) : sleep_offset_ns(&before_sleep);
+    result = freeze ? suspend_success_count(&success_before) : 0;
+    mono_before = er_now_ms();
+    if (!result) {
+        int sampled = er_boot_ms(&boot_before);
+        if (sampled == -EOPNOTSUPP && !freeze)
+            kernel_clock = false;
+        else
+            result = sampled;
+    }
     if (!result)
-        result = boottime_ns(&boot_before);
+        result = rtc_now(&clock, &rtc_before_time);
+    /* Preparation and the lifecycle callback can outlast a short alarm. Never
+     * enter sleep after its wake interrupt has already occurred. */
+    if (!result && seconds && armed <= rtc_before_time)
+        result = -ETIMEDOUT;
     if (result)
         goto done;
-    /* Freeze bypasses syscore/timekeeping suspend, so MONOTONIC need not stop.
-     * Confirm its kernel-completed cycle rather than treating clock offset as
-     * evidence. Both modes report the full suspend call's BOOTTIME duration. */
     result = er_write_text("/sys/power/state", d->info.suspend_mode);
-    int measured = boottime_ns(&boot_after);
+    int measured = kernel_clock ? er_boot_ms(&boot_after) : 0;
+    mono_after = er_now_ms();
     if (!measured)
-        measured = freeze ? suspend_success_count(&success_after) : sleep_offset_ns(&after_sleep);
-    bool confirmed =
-        freeze ? success_after > success_before : after_sleep - before_sleep >= 1000000;
-    did_suspend = !result && !measured && confirmed;
-    if (did_suspend)
-        d->last_sleep_ms = (uint64_t)(boot_after - boot_before) / 1000000;
+        measured = rtc_now(&clock, &rtc_after_time);
+    if (!measured && freeze)
+        measured = suspend_success_count(&success_after);
+    er_input_poll(d, 0);
+    rtc_fired = rtc_woke(&clock);
+    int64_t elapsed = kernel_clock ? boot_after - boot_before
+                                   : (int64_t)(rtc_after_time - rtc_before_time) * 1000;
+    int64_t gap = elapsed - (mono_after - mono_before);
+    /* Legacy RTC-only clocks have one-second precision. A completed syscall
+     * plus a stopped monotonic clock verifies deep sleep; freeze uses stats. */
+    bool confirmed = freeze ? success_after > success_before : gap >= 100;
+    did_suspend = !result && !measured && elapsed > 0 && confirmed;
+    if (did_suspend) {
+        d->last_sleep_ms = (uint64_t)elapsed;
+        d->last_sleep_gap_ms = gap > 0 ? (uint64_t)gap : 0;
+    }
     if (!result)
         result = measured ? measured : (did_suspend ? 0 : -EAGAIN);
 done:
-    if (alarm_set) {
-        char current[64];
-        int cleanup = er_read_text(alarm, current, sizeof(current));
-        if (!cleanup && armed[0] && !strcmp(current, armed))
-            cleanup = er_cancel_wake_alarm(d);
-        else if (!cleanup && current[0] && current[0] != '\n')
+    if (alarm_set && clock.fd >= 0) {
+        time_t current;
+        bool enabled;
+        int cleanup = rtc_alarm(&clock, &current, &enabled);
+        if (!cleanup && current == armed)
+            cleanup = rtc_program(&clock, 0, false);
+        else if (!cleanup && enabled)
             cleanup = -EBUSY;
-        if (!result)
+        if (cleanup)
             result = cleanup;
+    }
+    if (clock.fd >= 0)
+        close(clock.fd);
+    if (radio_restore) {
+        int restored = er_kobo_wifi_set(d, true);
+        if (restored)
+            result = restored;
     }
     if (lock >= 0)
         close(lock);
     if (did_suspend) {
         er_get_wake_reason(d, &d->last_wake);
-        if (power_counted && !wake_interrupt_count(ER_WAKE_POWER, &power_after) &&
-            power_after > power_before)
+        if (d->power_event_count > power_events_before ||
+            (power_counted && !wake_interrupt_count(ER_WAKE_POWER, &power_after) &&
+             power_after > power_before))
             d->last_wake.reason = ER_WAKE_POWER;
-        else if (d->last_wake.reason == ER_WAKE_UNKNOWN && rtc_counted &&
-                 !wake_interrupt_count(ER_WAKE_RTC, &rtc_after) && rtc_after > rtc_before)
+        else if (d->last_wake.reason == ER_WAKE_UNKNOWN &&
+                 (rtc_fired || (rtc_counted && !wake_interrupt_count(ER_WAKE_RTC, &rtc_after) &&
+                                rtc_after > rtc_before)))
             d->last_wake.reason = ER_WAKE_RTC;
         d->polling_started = false; /* Do not rediscover this same resume in the event poller. */
         notify(d, ER_EVENT_RESUMED, 0);
@@ -548,8 +758,10 @@ int er_suspend(er_device *d)
 }
 int er_suspend_for(er_device *d, unsigned seconds)
 {
-    if (!seconds || seconds > 86400)
+    if (!d || !seconds)
         return -EINVAL;
+    if (seconds > er_rtc_max_seconds(d))
+        return -ERANGE;
     return suspend_device(d, seconds);
 }
 

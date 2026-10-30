@@ -160,7 +160,8 @@ enum er_button {
     ER_BUTTON_DOWN,
     ER_BUTTON_LEFT,
     ER_BUTTON_RIGHT,
-    ER_BUTTON_SELECT
+    ER_BUTTON_SELECT,
+    ER_BUTTON_KEYBOARD
 };
 
 enum er_action {
@@ -266,6 +267,10 @@ int er_set_rotation(er_device *device, unsigned degrees);
  * Lifecycle notifications use the separate synchronous handler below.
  */
 int er_poll_event(er_device *device, struct er_event *event, int timeout_ms);
+/* Exclusively route navigation-bearing button devices to this handle. Touch and
+ * power-only devices remain shared. Close/process exit releases all grabs. */
+int er_grab_buttons(er_device *device);
+int er_release_buttons(er_device *device);
 /* Sample battery, USB, cover, watched capabilities and Wi-Fi into the event queue.
  * Firmware probes are synchronous. Call on a schedule appropriate to the application. */
 int er_sample_status(er_device *device);
@@ -291,11 +296,15 @@ int er_release_awake(er_device *device);
  * previous value. Keep this handle in a supervisor if the UI may be killed. */
 int er_retain_display(er_device *device);
 int er_release_display(er_device *device);
-/* Elapsed BOOTTIME in the last confirmed suspend cycle; 0 on a refused attempt. */
+/* Elapsed kernel uptime in the last confirmed suspend cycle; 0 on a refused attempt. */
 int er_get_last_sleep_ms(const er_device *device, uint64_t *milliseconds);
+/* Portion of that cycle excluded from CLOCK_MONOTONIC. Add this, not the full
+ * cycle duration, to application monotonic deadlines across suspend. */
+int er_get_last_sleep_gap_ms(const er_device *device, uint64_t *milliseconds);
 /* Last HAL suspend's wake source, including RTC child IRQs behind a PMIC parent. */
 int er_get_last_wake(const er_device *device, struct er_wake *wake);
-/* RTC-relative seconds, 1..86400. Existing alarms are never replaced. Explicit
+/* RTC-relative seconds, 1..ER_RTC_WAKE capability maximum. Existing alarms are
+ * never replaced. Explicit
  * cancel cancels any owner's alarm. Timed suspend cleans its own alarm on return.
  * Another wake source can cause early resume.
  */

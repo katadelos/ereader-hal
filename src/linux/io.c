@@ -92,6 +92,31 @@ int64_t er_now_ms(void)
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+/* CLOCK_BOOTTIME is Linux UAPI 7, absent from early Kindle headers. Older
+ * Lab126 kernels expose the RTC-measured suspend total as uptime's fourth field.
+ * Other old kernels use their RTC directly in the suspend transaction. */
+int er_boot_ms(int64_t *milliseconds)
+{
+    struct timespec now;
+    if (!clock_gettime((clockid_t)7, &now)) {
+        *milliseconds = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+        return 0;
+    }
+    if (errno != EINVAL)
+        return -errno;
+    char text[128];
+    int result = er_read_text("/proc/uptime", text, sizeof(text));
+    if (result)
+        return result;
+    unsigned long long slept;
+    if (sscanf(text, "%*s %*s %*s %llu", &slept) != 1)
+        return -EOPNOTSUPP;
+    if (slept > (unsigned long long)INT64_MAX / 1000)
+        return -EOVERFLOW;
+    *milliseconds = er_now_ms() + (int64_t)slept * 1000;
+    return 0;
+}
+
 int er_sleep_ms(unsigned milliseconds)
 {
     struct timespec remaining = {milliseconds / 1000, (milliseconds % 1000) * 1000000L};

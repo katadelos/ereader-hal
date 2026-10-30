@@ -10,12 +10,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+/* The oldest supported kernel header requires sa_family_t from sys/socket.h. */
+#include <linux/netlink.h>
 
 /* Linux UAPI values absent from the K4-era toolchain headers. */
 #define ER_ABS_MT_SLOT 0x2f
 #define ER_EVIOCGMTSLOTS(length) _IOC(_IOC_READ, 'E', 0x0a, length)
 #define ER_SYN_DROPPED 3
+#define ER_KEY_KEYBOARD 0x176
 
 static void restore_slots(struct er_input *input);
 
@@ -41,6 +46,7 @@ static const struct {
     {KEY_LEFT, ER_BUTTON_LEFT},
     {KEY_RIGHT, ER_BUTTON_RIGHT},
     {KEY_ENTER, ER_BUTTON_SELECT},
+    {ER_KEY_KEYBOARD, ER_BUTTON_KEYBOARD},
     {191, ER_BUTTON_NEXT},
     {193, ER_BUTTON_PREVIOUS},
 };
@@ -70,8 +76,69 @@ void er_input_clear(er_device *d)
         clear_input(&d->input[i]);
 }
 
+/* Older Kindle PMIC buttons use kernel uevents instead of evdev. Listening
+ * leaves powerd's own event stream intact and uses no model-specific app policy. */
+static int open_button_uevents(er_device *d)
+{
+    if (d->button_uevent_fd >= 0 || d->vendor != ER_KINDLE ||
+        access("/sys/class/misc/yoshibutton", F_OK))
+        return 0;
+    int fd = socket(AF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT);
+    if (fd < 0)
+        return -errno;
+    struct sockaddr_nl address = {.nl_family = AF_NETLINK, .nl_groups = 1};
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address))) {
+        int result = -errno;
+        close(fd);
+        return result;
+    }
+    d->button_uevent_fd = fd;
+    return 0;
+}
+
+static int read_button_uevents(er_device *d)
+{
+    if (d->button_uevent_fd < 0)
+        return 0;
+    for (;;) {
+        char message[4096];
+        struct sockaddr_nl sender = {0};
+        socklen_t length = sizeof(sender);
+        ssize_t size = recvfrom(d->button_uevent_fd,
+                                message,
+                                sizeof(message) - 1,
+                                0,
+                                (struct sockaddr *)&sender,
+                                &length);
+        if (size < 0)
+            return errno == EAGAIN || errno == EINTR ? 0 : -errno;
+        if (!size || sender.nl_pid != 0)
+            continue;
+        message[size] = '\0';
+        bool online = false, button = false;
+        for (char *part = message; part < message + size; part += strlen(part) + 1) {
+            if (!strcmp(part, "ACTION=online"))
+                online = true;
+            if (!strcmp(part, "DEVPATH=/devices/virtual/misc/yoshibutton"))
+                button = true;
+        }
+        if (online && button) {
+            struct er_event event = {.type = ER_EVENT_BUTTON};
+            event.data.button.button = ER_BUTTON_POWER;
+            event.data.button.action = ER_PRESS;
+            er_queue_event(d, &event);
+            event.data.button.action = ER_RELEASE;
+            er_queue_event(d, &event);
+            ++d->power_event_count;
+        }
+    }
+}
+
 int er_input_open(er_device *d)
 {
+    int result = open_button_uevents(d);
+    if (result)
+        return result;
     for (unsigned i = 0; i < ER_INPUT_COUNT; ++i)
         if (d->input[i].fd < 0)
             d->input[i].error = ENODEV;
@@ -120,6 +187,22 @@ int er_input_open(er_device *d)
             continue;
         }
         struct er_input *input = &d->input[index];
+        input->navigation = false;
+        for (size_t j = 0; j < sizeof(buttons) / sizeof(buttons[0]); ++j)
+            if (buttons[j].button != ER_BUTTON_POWER && bit_set(keys, buttons[j].code))
+                input->navigation = true;
+        if (bit_set(keys, 194) ||
+            (d->info.features.firmware_keyboard && bit_set(keys, KEY_LEFTCTRL)))
+            input->navigation = true;
+        input->grabbed = false;
+        if (!is_touch && input->navigation && d->buttons_grabbed) {
+            if (ioctl(fd, EVIOCGRAB, 1)) {
+                input->error = errno;
+                close(fd);
+                continue;
+            }
+            input->grabbed = true;
+        }
         input->touch = is_touch;
         input->single = !bit_set(axes, ABS_MT_POSITION_X);
         snprintf(input->path, sizeof(input->path), "%s", paths.gl_pathv[i]);
@@ -161,13 +244,62 @@ int er_input_open(er_device *d)
     return 0;
 }
 
+int er_release_buttons(er_device *d)
+{
+    if (!d)
+        return -EINVAL;
+    d->buttons_grabbed = false;
+    int result = 0;
+    for (unsigned i = 0; i < ER_INPUT_COUNT; ++i) {
+        struct er_input *input = &d->input[i];
+        if (!input->grabbed || input->fd < 0)
+            continue;
+        if (ioctl(input->fd, EVIOCGRAB, 0)) {
+            if (!result)
+                result = -errno;
+        } else {
+            input->grabbed = false;
+        }
+    }
+    return result;
+}
+
+int er_grab_buttons(er_device *d)
+{
+    if (!d)
+        return -EINVAL;
+    if (d->buttons_grabbed)
+        return 0;
+    int result = er_input_open(d);
+    if (result)
+        return result;
+    for (unsigned i = 0; i < ER_INPUT_COUNT; ++i) {
+        struct er_input *input = &d->input[i];
+        if (input->touch || !input->navigation || input->fd < 0 || input->grabbed)
+            continue;
+        if (ioctl(input->fd, EVIOCGRAB, 1)) {
+            result = -errno;
+            er_release_buttons(d);
+            return result;
+        }
+        input->grabbed = true;
+    }
+    d->buttons_grabbed = true;
+    return 0;
+}
+
 void er_input_close(er_device *d)
 {
+    if (d->button_uevent_fd >= 0)
+        close(d->button_uevent_fd);
+    d->button_uevent_fd = -1;
     for (unsigned i = 0; i < ER_INPUT_COUNT; ++i) {
         if (d->input[i].fd >= 0)
             close(d->input[i].fd);
         d->input[i].fd = -1;
+        d->input[i].grabbed = false;
     }
+    d->buttons_grabbed = false;
 }
 
 static int scale_axis(int value, const struct input_absinfo *axis, unsigned length)
@@ -349,6 +481,8 @@ static void handle_input(er_device *d, struct er_input *input, const struct inpu
                 else if (code == 194)
                     code = KEY_ENTER;
             }
+            if (d->info.features.firmware_keyboard && code == KEY_LEFTCTRL)
+                code = ER_KEY_KEYBOARD;
             size_t i = 0;
             while (i < sizeof(buttons) / sizeof(buttons[0]) && buttons[i].code != code)
                 ++i;
@@ -356,6 +490,8 @@ static void handle_input(er_device *d, struct er_input *input, const struct inpu
                 return;
             event.data.button.button = buttons[i].button;
             event.data.button.action = (enum er_action)raw->value;
+            if (event.data.button.button == ER_BUTTON_POWER && raw->value == 1)
+                ++d->power_event_count;
         }
     } else if (raw->type == EV_MSC && raw->code == MSC_RAW && d->vendor == ER_KOBO) {
         event.type = ER_EVENT_ORIENTATION;
@@ -382,16 +518,18 @@ static void handle_input(er_device *d, struct er_input *input, const struct inpu
 
 int er_input_poll(er_device *d, int timeout_ms)
 {
-    struct pollfd fds[ER_INPUT_COUNT];
+    struct pollfd fds[ER_INPUT_COUNT + 1];
     for (unsigned i = 0; i < ER_INPUT_COUNT; ++i)
         fds[i] = (struct pollfd){.fd = d->input[i].fd, .events = POLLIN};
-    int ready = poll(fds, ER_INPUT_COUNT, timeout_ms);
+    fds[ER_INPUT_COUNT] = (struct pollfd){.fd = d->button_uevent_fd, .events = POLLIN};
+    int ready = poll(fds, ER_INPUT_COUNT + 1, timeout_ms);
     if (ready < 0)
         return -errno;
     for (unsigned i = 0; i < ER_INPUT_COUNT; ++i) {
         if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             close(d->input[i].fd);
             d->input[i].fd = -1;
+            d->input[i].grabbed = false;
             d->input[i].error = ENODEV;
             er_input_reset(d);
             er_status_error(d, d->input[i].touch ? ER_TOUCH : ER_BUTTONS, -ENODEV);
@@ -409,7 +547,7 @@ int er_input_poll(er_device *d, int timeout_ms)
                 handle_input(d, &d->input[i], &raw[j]);
         }
     }
-    return 0;
+    return read_button_uevents(d);
 }
 
 int er_input_capability_probe(er_device *d, enum er_capability capability)

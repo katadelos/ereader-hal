@@ -152,6 +152,7 @@ class Button(IntEnum):
     LEFT = 8
     RIGHT = 9
     SELECT = 10
+    KEYBOARD = 11
 
 
 class Action(IntEnum):

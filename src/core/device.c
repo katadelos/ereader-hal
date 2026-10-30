@@ -58,6 +58,7 @@ int er_open(er_device **out)
     d->saved_brightness = -1;
     d->inhibit_fd = -1;
     d->display_lock_fd = -1;
+    d->button_uevent_fd = -1;
     d->low_battery_threshold = 10;
     for (int i = 0; i < ER_INPUT_COUNT; ++i)
         d->input[i].fd = -1;

@@ -303,6 +303,8 @@ def load(path=None):
         bind("er_get_" + name, device, ct.POINTER(structure))
     bind("er_set_rotation", device, ct.c_uint)
     bind("er_poll_event", device, ct.POINTER(Event), ct.c_int)
+    bind("er_grab_buttons", device)
+    bind("er_release_buttons", device)
     bind("er_sample_status", device)
     bind("er_set_low_battery_threshold", device, ct.c_int)
     bind("er_set_lifecycle_handler", device, LifecycleHandler, ct.c_void_p)
@@ -316,6 +318,7 @@ def load(path=None):
     bind("er_retain_display", device)
     bind("er_release_display", device)
     bind("er_get_last_sleep_ms", device, ct.POINTER(ct.c_uint64))
+    bind("er_get_last_sleep_gap_ms", device, ct.POINTER(ct.c_uint64))
     bind("er_get_last_wake", device, ct.POINTER(Wake))
     bind("er_get_wifi_status", device, ct.POINTER(WifiStatus))
     bind(

@@ -15,6 +15,7 @@ struct er_input {
     int fd, error;
     char path[64];
     bool touch, slots, single, dropped, touch_down;
+    bool navigation, grabbed;
     int slot;
     struct input_absinfo x_axis, y_axis;
     struct er_contact current[ER_CONTACT_COUNT], previous[ER_CONTACT_COUNT];
