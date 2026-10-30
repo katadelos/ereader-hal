@@ -21,6 +21,9 @@ struct er_device {
     char wifi_interface[16];
     struct er_info info;
     int brightness_max, saved_brightness;
+    er_brightness_reader brightness_reader;
+    er_brightness_writer brightness_writer;
+    void *brightness_context;
     bool light_valid;
     int light_brightness, light_warmth, light_values[3];
     struct er_input input[ER_INPUT_COUNT];

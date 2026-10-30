@@ -244,6 +244,14 @@ const struct er_info *er_get_info(const er_device *device);
 const char *er_capability_name(enum er_capability capability);
 int er_get_capability(er_device *device, enum er_capability capability,
                       struct er_capability_info *info);
+/* An application-owned service may provide live state for a write-only light.
+ * Both callbacks use percentages and return 0 or a negative errno. They must
+ * remain valid until cleared or close, and must not call this device recursively.
+ * Registration is per handle; NULL callbacks restore the native backend. */
+typedef int (*er_brightness_reader)(int *percent, void *context);
+typedef int (*er_brightness_writer)(int percent, void *context);
+int er_set_brightness_provider(er_device *device, er_brightness_reader reader,
+                               er_brightness_writer writer, void *context);
 int er_get_brightness(const er_device *device, int *percent);
 int er_set_brightness(er_device *device, int percent);
 int er_get_warmth(const er_device *device, int *percent);

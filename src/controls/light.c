@@ -7,6 +7,20 @@
 #define KOBO_LIGHT "/sys/class/backlight/mxc_msp430.0/brightness"
 #define POWERD "com.lab126.powerd"
 
+int er_set_brightness_provider(er_device *d, er_brightness_reader reader,
+                               er_brightness_writer writer, void *context)
+{
+    if (!d || (!reader != !writer))
+        return -EINVAL;
+    if (reader && !(d->info.capabilities & ER_BRIGHTNESS))
+        return -EOPNOTSUPP;
+    d->brightness_reader = reader;
+    d->brightness_writer = writer;
+    d->brightness_context = context;
+    d->capability_valid &= ~(ER_BRIGHTNESS | ER_FRONTLIGHT);
+    return 0;
+}
+
 int er_get_brightness(const er_device *d, int *percent)
 {
     if (!percent)
@@ -14,6 +28,15 @@ int er_get_brightness(const er_device *d, int *percent)
     int result = er_supported(d, ER_BRIGHTNESS), raw;
     if (result)
         return result;
+    if (d->brightness_reader) {
+        result = d->brightness_reader(&raw, d->brightness_context);
+        if (result)
+            return result < 0 ? result : -EIO;
+        if (raw < 0 || raw > 100)
+            return -ERANGE;
+        *percent = raw;
+        return 0;
+    }
     if (d->profile->light_channels[0]) {
         int warmth;
         return er_kobo_light_get(d, percent, &warmth);
@@ -49,6 +72,14 @@ int er_set_brightness(er_device *d, int percent)
     int result = er_supported(d, ER_BRIGHTNESS);
     if (result)
         return result;
+    if (d->brightness_writer) {
+        result = d->brightness_writer(percent, d->brightness_context);
+        if (result)
+            return result < 0 ? result : -EIO;
+        if (percent > 0)
+            d->saved_brightness = percent;
+        return 0;
+    }
     if (d->profile->light_channels[0]) {
         result = er_kobo_light_set(d, percent, -1);
         if (!result && percent > 0)

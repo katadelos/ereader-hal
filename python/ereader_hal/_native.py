@@ -265,6 +265,8 @@ class Event(ct.Structure):
 
 
 LifecycleHandler = ct.CFUNCTYPE(ct.c_int, ct.POINTER(Event), ct.c_void_p)
+BrightnessReader = ct.CFUNCTYPE(ct.c_int, ct.POINTER(ct.c_int), ct.c_void_p)
+BrightnessWriter = ct.CFUNCTYPE(ct.c_int, ct.c_int, ct.c_void_p)
 
 
 def load(path=None):
@@ -286,6 +288,7 @@ def load(path=None):
     bind("er_get_info", device, result=ct.POINTER(Info))
     bind("er_get_identity", device, ct.POINTER(Identity))
     bind("er_get_capability", device, ct.c_int, ct.POINTER(CapabilityInfo))
+    bind("er_set_brightness_provider", device, BrightnessReader, BrightnessWriter, ct.c_void_p)
     for name in ("brightness", "warmth"):
         bind("er_get_" + name, device, ct.POINTER(ct.c_int))
         bind("er_set_" + name, device, ct.c_int)

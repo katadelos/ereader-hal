@@ -175,7 +175,10 @@ int er_get_capability(er_device *d, enum er_capability cap, struct er_capability
     case ER_FRONTLIGHT:
         info->maximum = 100;
         info->steps = d->brightness_max + 1;
-        if (d->vendor == ER_KOBO) {
+        if (d->brightness_reader) {
+            info->steps = 101;
+            result = er_get_brightness(d, &value);
+        } else if (d->vendor == ER_KOBO) {
             result = er_kobo_light_probe(d, cap);
         } else {
             result = kindle_property("com.lab126.powerd", "flIntensity", &value, info);
@@ -188,7 +191,7 @@ int er_get_capability(er_device *d, enum er_capability cap, struct er_capability
                 info->steps = d->brightness_max + 1;
             }
         }
-        if (!result && d->profile->light_off_path)
+        if (!result && !d->brightness_reader && d->profile->light_off_path)
             result = accessible(d->profile->light_off_path, R_OK | W_OK);
         break;
     case ER_WARMTH:

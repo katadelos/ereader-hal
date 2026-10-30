@@ -100,6 +100,7 @@ class Device:
         self._lib = _native.load(library)
         self._handle = ct.c_void_p()
         self._callback = None
+        self._brightness_callbacks = None
         self._callback_error = None
         self._in_callback = False
         _check(self._lib.er_open(ct.byref(self._handle)))
@@ -107,7 +108,7 @@ class Device:
 
     def _require_open(self):
         if self._in_callback:
-            raise RuntimeError("do not call this device from its lifecycle handler")
+            raise RuntimeError("do not call this device from its callbacks")
         if not self._finalizer.alive:
             raise RuntimeError("device is closed")
 
@@ -128,12 +129,13 @@ class Device:
     def close(self):
         """Release the device. Cleanup failure keeps it open so close() can be retried."""
         if self._in_callback:
-            raise RuntimeError("do not close this device from its lifecycle handler")
+            raise RuntimeError("do not close this device from its callbacks")
         if self._finalizer.alive:
             _check(self._lib.er_close(self._handle))
             self._finalizer.detach()
             self._handle = ct.c_void_p()
             self._callback = None
+            self._brightness_callbacks = None
 
     def __enter__(self):
         self._require_open()
@@ -155,6 +157,55 @@ class Device:
         value = _native.CapabilityInfo()
         self._call(self._lib.er_get_capability, _capability(capability), ct.byref(value))
         return _native.capability_info(value)
+
+    def set_brightness_provider(self, reader, writer):
+        """Provide live reader() -> percent and writer(percent), or pass two None values.
+
+        Callbacks are retained until replaced or close. They must not re-enter
+        this device. OSError becomes a HAL error or unavailable capability;
+        other exceptions propagate from the enclosing HAL operation.
+        """
+        if reader is None and writer is None:
+            callbacks = (_native.BrightnessReader(), _native.BrightnessWriter())
+        else:
+            if not callable(reader) or not callable(writer):
+                raise TypeError("reader and writer must both be callable or None")
+            device = weakref.ref(self)
+
+            def invoke(function, *arguments):
+                current = device()
+                if current is None:
+                    return -errno.EBADF
+                current._in_callback = True
+                try:
+                    return function(*arguments)
+                except OSError as error:
+                    code = error.errno
+                    return -code if isinstance(code, int) and code > 0 else -errno.EIO
+                except BaseException as error:
+                    if current._callback_error is None:
+                        current._callback_error = error
+                    return -errno.EIO
+                finally:
+                    current._in_callback = False
+
+            def read_value(percent, context):
+                def read():
+                    percent[0] = _integer(reader(), 0, 100)
+                    return 0
+
+                return invoke(read)
+
+            def write_value(percent, context):
+                def write():
+                    result = writer(percent)
+                    return 0 if result is None else _integer(result, -0x7FFFFFFF, 0)
+
+                return invoke(write)
+
+            callbacks = (_native.BrightnessReader(read_value), _native.BrightnessWriter(write_value))
+        self._call(self._lib.er_set_brightness_provider, *callbacks, None)
+        self._brightness_callbacks = callbacks
 
     def get_brightness(self):
         return self._get(self._lib.er_get_brightness, ct.c_int).value
